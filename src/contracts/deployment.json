@@ -1,0 +1,54 @@
+{
+  "testnet": {
+    "network": "MST Chain Testnet",
+    "chainId": "0x5752035",
+    "chainIdDecimal": 91562037,
+    "rpcUrl": "https://testnetrpc.mstblockchain.com",
+    "blockExplorerUrl": "https://testnet.mstscan.com",
+    "nativeCurrency": {
+      "name": "MSTC",
+      "symbol": "MSTC",
+      "decimals": 18
+    },
+    "contractAddress": "0xe9097672C2556318f1BD974323174baA43b88514",
+    "deploymentTxHash": "0x7fbc35a3cc8b7de8ff99154b29dfc2d890c5c2400820c107938dfe0a116b5344",
+    "deployedAtBlock": 6644251,
+    "deployerAddress": "0x6D9618b1Ee522d22f3C168B40A33466A89af00C4",
+    "deployed": true,
+    "deployedAt": "2026-10-28T14:39:03.378Z"
+  },
+  "mainnet": {
+    "network": "MST Chain Mainnet",
+    "chainId": "0x1226",
+    "chainIdDecimal": 4646,
+    "rpcUrl": "https://4646.rpc.thirdweb.com",
+    "blockExplorerUrl": "https://mstscan.com",
+    "nativeCurrency": {
+      "name": "MSTC",
+      "symbol": "MSTC",
+      "decimals": 18
+    },
+    "contractAddress": "",
+    "deploymentTxHash": "",
+    "deployedAtBlock": null,
+    "deployerAddress": "",
+    "deployed": false,
+    "deployedAt": null
+  },
+  "network": "MST Chain Testnet",
+  "chainId": "0x5752035",
+  "chainIdDecimal": 91562037,
+  "rpcUrl": "https://testnetrpc.mstblockchain.com",
+  "blockExplorerUrl": "https://testnet.mstscan.com",
+  "nativeCurrency": {
+    "name": "MSTC",
+    "symbol": "MSTC",
+    "decimals": 18
+  },
+  "contractAddress": "0xe9097672C2556318f1BD974323174baA43b88514",
+  "deploymentTxHash": "0x7fbc35a3cc8b7de8ff99154b29dfc2d890c5c2400820c107938dfe0a116b5344",
+  "deployedAtBlock": 6644251,
+  "deployerAddress": "0x6D9618b1Ee522d22f3C168B40A33466A89af00C4",
+  "deployed": true,
+  "deployedAt": "2026-10-28T14:39:03.378Z"
+}

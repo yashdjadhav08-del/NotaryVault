@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    color: #1C1C1C;
+    background-color: #F7F4ED;
+    overflow-x: hidden;
+  }
+
+  /* Custom smooth scrolling */
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+@keyframes marquee {
+  0% { transform: translateX(0%); }
+  100% { transform: translateX(-50%); }
+}
+
+.animate-marquee {
+  display: flex;
+  width: max-content;
+  animation: marquee 30s linear infinite;
+}
+
+.animate-marquee.paused {
+  animation-play-state: paused;
+}
+
+/* Design tool bounding box decoration */
+.selection-box {
+  position: relative;
+  border: 1.5px dashed #3B6EF5;
+}
+
+.selection-handle {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  background-color: #3B6EF5;
+  border: 1px solid white;
+}
+
+.selection-handle.tl { top: -4px; left: -4px; }
+.selection-handle.tr { top: -4px; right: -4px; }
+.selection-handle.bl { bottom: -4px; left: -4px; }
+.selection-handle.br { bottom: -4px; right: -4px; }
+
+/* Custom subtle scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
