@@ -71,3 +71,33 @@ export function bytes32ToHash(bytes32Str: string): string {
   }
   return clean.toLowerCase();
 }
+
+/**
+ * Normalizes any SHA-256 hash string to a canonical 64-character lowercase hex digest
+ * without leading 0x prefix. Trims whitespace, strips 0x/0X, and converts to lowercase.
+ */
+export function normalizeSha256(hash?: string | null): string {
+  if (!hash || typeof hash !== 'string') return '';
+  const trimmed = hash.trim();
+  const clean = (trimmed.startsWith('0x') || trimmed.startsWith('0X')) ? trimmed.slice(2) : trimmed;
+  return clean.toLowerCase();
+}
+
+/**
+ * Returns a canonical 0x-prefixed 66-character lowercase hexadecimal digest.
+ */
+export function toPrefixedSha256(hash?: string | null): string {
+  const norm = normalizeSha256(hash);
+  return norm ? `0x${norm}` : '';
+}
+
+/**
+ * Compares two SHA-256 hashes for exact 32-byte cryptographic equality,
+ * handling case sensitivity and optional '0x' prefix consistently.
+ */
+export function areSha256HashesEqual(h1?: string | null, h2?: string | null): boolean {
+  const n1 = normalizeSha256(h1);
+  const n2 = normalizeSha256(h2);
+  return n1.length === 64 && n1 === n2;
+}
+

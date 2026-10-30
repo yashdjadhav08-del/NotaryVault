@@ -335,7 +335,7 @@ export const PinkSidebarResourceMiniUI: React.FC = () => {
               <div className="text-[9px] text-stone-400">14 articles</div>
             </div>
             <div className="p-2 border border-black/5 rounded-lg bg-purple-50/50">
-              <div className="text-[10px] font-bold text-purple-700">QR Verification</div>
+              <div className="text-[10px] font-bold text-purple-700">Public Verification</div>
               <div className="text-[9px] text-stone-400">8 articles</div>
             </div>
           </div>

@@ -12,11 +12,15 @@ import {
   X, 
   ExternalLink,
   ChevronRight,
-  Globe
+  Globe,
+  Crown,
+  UserCheck,
+  Users
 } from 'lucide-react';
 
 import { WalletButton } from '../ui/WalletButton';
 import { useWallet } from '../../context/WalletContext';
+import { useAuthors } from '../../context/AuthorContext';
 
 interface AppShellProps {
   title: string;
@@ -33,7 +37,16 @@ export const AppShell: React.FC<AppShellProps> = ({
 }) => {
   const location = useLocation();
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
-  const { selectedNetwork, setSelectedNetwork, activeNetworkConfig } = useWallet();
+  const { 
+    selectedNetwork, 
+    setSelectedNetwork, 
+    activeNetworkConfig, 
+    status: walletStatus, 
+    isSuperAuthor, 
+    isSecondaryAuthor, 
+    isAuthor 
+  } = useWallet();
+  const { pendingApplicationsCount } = useAuthors();
 
   const mainNavItems = [
     { label: 'Dashboard', path: '/app', icon: <LayoutDashboard className="w-4 h-4" /> },
@@ -116,6 +129,70 @@ export const AppShell: React.FC<AppShellProps> = ({
                   </Link>
                 );
               })}
+            </nav>
+          </div>
+
+          {/* AUTHOR SYSTEM Section */}
+          <div>
+            <div className="px-3 text-[11px] font-bold text-stone-400 tracking-wider uppercase mb-2">
+              AUTHOR SYSTEM
+            </div>
+            <nav className="space-y-1">
+              {isSuperAuthor && (
+                <Link
+                  to="/app/author-applications"
+                  onClick={() => setMobileDrawerOpen(false)}
+                  className={`flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                    isActive('/app/author-applications')
+                      ? 'bg-[#152238] text-white shadow-sm font-semibold'
+                      : 'text-stone-300 hover:text-white hover:bg-white/5'
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <span className={isActive('/app/author-applications') ? 'text-amber-400' : 'text-stone-400'}>
+                      <UserCheck className="w-4 h-4" />
+                    </span>
+                    <span>Review Applications</span>
+                  </div>
+                  {pendingApplicationsCount > 0 && (
+                    <span className="px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-mono text-[10px] border border-amber-500/30">
+                      {pendingApplicationsCount}
+                    </span>
+                  )}
+                </Link>
+              )}
+
+              <Link
+                to="/app/authors"
+                onClick={() => setMobileDrawerOpen(false)}
+                className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                  isActive('/app/authors')
+                    ? 'bg-[#152238] text-white shadow-sm font-semibold'
+                    : 'text-stone-300 hover:text-white hover:bg-white/5'
+                }`}
+              >
+                <span className={isActive('/app/authors') ? 'text-[#1F6FF0]' : 'text-stone-400'}>
+                  <Users className="w-4 h-4" />
+                </span>
+                <span>Author Directory</span>
+              </Link>
+
+              {!isAuthor && (
+                <Link
+                  to="/app/apply-author"
+                  onClick={() => setMobileDrawerOpen(false)}
+                  className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                    isActive('/app/apply-author')
+                      ? 'bg-[#152238] text-white shadow-sm font-semibold'
+                      : 'text-stone-300 hover:text-white hover:bg-white/5'
+                  }`}
+                >
+                  <span className={isActive('/app/apply-author') ? 'text-[#1F6FF0]' : 'text-stone-400'}>
+                    <PlusCircle className="w-4 h-4" />
+                  </span>
+                  <span>Become an Author</span>
+                </Link>
+              )}
             </nav>
           </div>
         </div>
@@ -229,6 +306,31 @@ export const AppShell: React.FC<AppShellProps> = ({
                 <span>Mainnet</span>
               </button>
             </div>
+
+            {/* Connected Role Badge */}
+            {walletStatus === 'connected' && (
+              <div className="hidden sm:flex items-center">
+                {isSuperAuthor ? (
+                  <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-50 text-amber-900 border border-amber-200 flex items-center gap-1.5 shadow-2xs">
+                    <Crown className="w-3.5 h-3.5 text-amber-600" />
+                    <span>Super Author</span>
+                  </span>
+                ) : isSecondaryAuthor ? (
+                  <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-blue-50 text-blue-900 border border-blue-200 flex items-center gap-1.5 shadow-2xs">
+                    <ShieldCheck className="w-3.5 h-3.5 text-[#1F6FF0]" />
+                    <span>Secondary Author</span>
+                  </span>
+                ) : (
+                  <Link
+                    to="/app/apply-author"
+                    className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-stone-100 text-stone-700 hover:bg-stone-200 border border-stone-200 flex items-center gap-1.5 transition-all shadow-2xs"
+                  >
+                    <span>Public User</span>
+                    <span className="text-[#1F6FF0] font-bold">• Apply</span>
+                  </Link>
+                )}
+              </div>
+            )}
 
             <WalletButton />
           </div>

@@ -6,15 +6,17 @@ import { Button } from '../components/ui/Button';
 import { StatusPill } from '../components/ui/StatusPill';
 import { Modal } from '../components/ui/Modal';
 import { Input } from '../components/ui/Input';
-import { OptionRow } from '../components/ui/OptionRow';
 import { useDocuments } from '../context/DocumentContext';
 import { useWallet } from '../context/WalletContext';
 import { 
   isContractConfigured, 
   getExplorerTxUrl, 
   getExplorerAddressUrl, 
+  getOnChainDetails,
+  getDeploymentConfig,
   MST_NETWORKS 
 } from '../services/contractService';
+import type { DocumentType, DocumentRecord } from '../types';
 import { 
   ArrowLeft, 
   Copy, 
@@ -29,40 +31,278 @@ import {
   User,
   Link as LinkIcon,
   AlertTriangle,
-  Flame
+  Flame,
+  RefreshCw,
+  Key,
+  Lock,
+  Mail,
+  Phone,
+  Send,
+  CheckCircle2
 } from 'lucide-react';
-import { QRCodeSVG } from 'qrcode.react';
-import { formatDate, formatDateTime, formatFileSize } from '../lib/format';
+import { downloadDocumentReceipt } from '../lib/receipt';
+import { formatDate, formatDateTime, formatFileSize, formatRegistrationTimestamp } from '../lib/format';
+import { buildPublicVerificationUrl } from '../lib/qr';
+import { 
+  hasLocalPDF, 
+  downloadLocalPDF, 
+  LOCAL_STORAGE_DISCLAIMER,
+  downloadVerifiedOriginalPDF,
+  requestAuthChallenge,
+  verifyAuthSignature,
+  getClientSession,
+  createPrivateAccessToken,
+  shareDocumentWithDelivery,
+  listDocumentShares,
+  revokeDocumentShare,
+  type VerifiedDownloadResult,
+  type DocumentShareResult,
+  type ServerShareRecord
+} from '../lib/pdfStorage';
 
 export const DocumentDetailsPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { getDocumentById, activities, shareDocument, addToast, registerExistingDocumentOnChain, revokeDocumentOnChain } = useDocuments();
+  const { 
+    getDocumentById, 
+    activities, 
+    shareDocument, 
+    addToast, 
+    registerExistingDocumentOnChain, 
+    revokeDocumentOnChain,
+    isSyncing 
+  } = useDocuments();
   const { 
     status: walletStatus, 
+    address: walletAddress,
     provider, 
     selectedNetwork, 
     activeNetworkConfig, 
     isCorrectNetwork 
   } = useWallet();
 
-  const doc = getDocumentById(id || '');
+  const catalogDoc = getDocumentById(id || '');
+  const [onChainDoc, setOnChainDoc] = useState<DocumentRecord | null>(null);
+  const [isLookingUp, setIsLookingUp] = useState<boolean>(false);
+
+  // Fallback: If not in local catalog, query on-chain contract directly
+  React.useEffect(() => {
+    if (!catalogDoc && id) {
+      setIsLookingUp(true);
+      getOnChainDetails(id, selectedNetwork)
+        .then(details => {
+          if (details && details.exists) {
+            const reconstructed: DocumentRecord = {
+              id: details.docId,
+              name: details.docId === 'NV-2026-566456' ? 'Property Deed' : `Document ${details.docId}`,
+              type: (details.documentType as DocumentType) || 'Property Deed',
+              description: `Document registered on-chain on ${activeNetworkConfig.name}. Restored from verified blockchain events.`,
+              owner: details.registrant || 'On-Chain Registrant',
+              issueDate: new Date(details.registeredAt * 1000).toISOString().slice(0, 10),
+              registeredAt: new Date(details.registeredAt * 1000).toISOString(),
+              status: details.isRevoked ? 'Hash Mismatch' : 'Registered',
+              sha256Hash: details.documentHash,
+              fileName: `${details.docId}.pdf`,
+              fileSizeBytes: 0,
+              qrPayloadUrl: `/verify/${details.docId}`,
+              networkKey: selectedNetwork,
+              contractAddress: getDeploymentConfig(selectedNetwork)?.contractAddress,
+              networkChainId: activeNetworkConfig.chainIdHex,
+              registrantAddress: details.registrant,
+              onChainStatus: details.isRevoked ? 'revoked' : 'registered',
+            };
+            setOnChainDoc(reconstructed);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setIsLookingUp(false));
+    }
+  }, [catalogDoc, id, selectedNetwork, activeNetworkConfig]);
+
+  const doc = catalogDoc || onChainDoc;
+
+  const [hasPdfLocally, setHasPdfLocally] = useState<boolean | null>(null);
+
+  React.useEffect(() => {
+    if (doc?.id) {
+      hasLocalPDF(doc.id).then(setHasPdfLocally);
+    }
+  }, [doc?.id]);
 
   const [copiedHash, setCopiedHash] = useState(false);
   const [copiedTxHash, setCopiedTxHash] = useState(false);
-  const [copiedQrLink, setCopiedQrLink] = useState(false);
+  const [copiedVerifyUrl, setCopiedVerifyUrl] = useState(false);
   const [isAnchoring, setIsAnchoring] = useState(false);
   const [isRevoking, setIsRevoking] = useState(false);
   const [mainnetActionModal, setMainnetActionModal] = useState<'anchor' | 'revoke' | null>(null);
   const [mainnetAcknowledged, setMainnetAcknowledged] = useState(false);
 
-  // Share Modal State
+  // Enhanced Share & Multi-Channel Delivery Modal State
   const [shareModalOpen, setShareModalOpen] = useState(false);
-  const [recipient, setRecipient] = useState('');
-  const [durationDays, setDurationDays] = useState(7);
-  const [durationLabel, setDurationLabel] = useState('7 Days');
+  const [shareEmail, setShareEmail] = useState('');
+  const [sendPdfByEmail, setSendPdfByEmail] = useState(true);
+  const [recipientConsent, setRecipientConsent] = useState(true);
+  const [expiryPolicy, setExpiryPolicy] = useState<'1h' | '24h' | '7d' | '30d' | '90d' | 'never'>('24h');
   const [isSharing, setIsSharing] = useState(false);
   const [shareError, setShareError] = useState('');
+  const [shareDeliveryResult, setShareDeliveryResult] = useState<DocumentShareResult | null>(null);
+  const [activeShares, setActiveShares] = useState<ServerShareRecord[]>([]);
+  const [copiedShareLink, setCopiedShareLink] = useState(false);
+
+  // Authenticated Private PDF Download & Token State
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadResult, setDownloadResult] = useState<VerifiedDownloadResult | null>(null);
+  const [accessTokenModalOpen, setAccessTokenModalOpen] = useState(false);
+  const [tokenDurationHours, setTokenDurationHours] = useState(24);
+  const [tokenPurpose, setTokenPurpose] = useState('Confidential Legal Verification');
+  const [isCreatingToken, setIsCreatingToken] = useState(false);
+  const [createdTokenInfo, setCreatedTokenInfo] = useState<{ token: string; expiresAt?: string; url: string } | null>(null);
+  const [copiedPrivateLink, setCopiedPrivateLink] = useState(false);
+
+  // Authenticated Owner PDF Download Handler
+  const handleAuthenticatedDownload = async () => {
+    if (!doc) return;
+    setIsDownloading(true);
+    setDownloadResult(null);
+
+    try {
+      let session = getClientSession();
+      const activeAddr = walletAddress?.toLowerCase();
+      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
+
+      if (!isSessionValid) {
+        if (walletStatus !== 'connected' || !provider || !walletAddress) {
+          addToast('Wallet Connection Required', 'Please connect your owner wallet to authenticate private document access.', 'warning');
+          setIsDownloading(false);
+          return;
+        }
+
+        const challenge = await requestAuthChallenge(walletAddress);
+        if (!challenge.success || !challenge.challengeText) {
+          throw new Error(challenge.error || 'Could not obtain authentication challenge.');
+        }
+
+        const signer = await provider.getSigner();
+        const signature = await signer.signMessage(challenge.challengeText);
+
+        const verifyRes = await verifyAuthSignature({
+          address: walletAddress,
+          signature,
+          challengeId: challenge.challengeId,
+          challengeText: challenge.challengeText,
+        });
+
+        if (!verifyRes.success || !verifyRes.session) {
+          throw new Error(verifyRes.error || 'Server authorization rejected cryptographic signature.');
+        }
+        session = verifyRes.session;
+      }
+
+      if (!session) {
+        throw new Error('Authentication session could not be established.');
+      }
+
+      const res = await downloadVerifiedOriginalPDF(
+        doc.id,
+        doc.sha256Hash,
+        doc.fileName || `${doc.id}.pdf`,
+        { sessionToken: session.token }
+      );
+
+      setDownloadResult(res);
+      if (res.success) {
+        addToast('Integrity Verified', 'Downloaded PDF exact bytes match on-chain SHA-256 fingerprint.');
+      } else if (res.isTampered) {
+        addToast('Tamper Warning', res.error || 'Hash mismatch detected.', 'error');
+      } else {
+        addToast('Download Failed', res.error || 'Access denied by server authorization.', 'error');
+      }
+    } catch (err: any) {
+      setDownloadResult({
+        success: false,
+        error: err?.message || 'Authentication failed.',
+      });
+      addToast('Authorization Failed', err?.message || 'Signature rejected.', 'error');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  // Generate Expiring Private Access Token Handler
+  const handleCreateAccessToken = async () => {
+    if (!doc) return;
+    setIsCreatingToken(true);
+    try {
+      let session = getClientSession();
+      const activeAddr = walletAddress?.toLowerCase();
+      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
+
+      if (!isSessionValid) {
+        if (walletStatus !== 'connected' || !provider || !walletAddress) {
+          addToast('Wallet Required', 'Connect your owner wallet to generate access tokens.', 'warning');
+          setIsCreatingToken(false);
+          return;
+        }
+
+        const challenge = await requestAuthChallenge(walletAddress);
+        const signer = await provider.getSigner();
+        const signature = await signer.signMessage(challenge.challengeText);
+
+        const verifyRes = await verifyAuthSignature({
+          address: walletAddress,
+          signature,
+          challengeId: challenge.challengeId,
+          challengeText: challenge.challengeText,
+        });
+
+        if (!verifyRes.success || !verifyRes.session) {
+          throw new Error(verifyRes.error || 'Signature rejected.');
+        }
+        session = verifyRes.session;
+      }
+
+      if (!session) {
+        throw new Error('Authentication session could not be established.');
+      }
+
+      const res = await createPrivateAccessToken(
+        doc.id,
+        session.token,
+        tokenDurationHours,
+        tokenPurpose.trim() || 'Confidential Access'
+      );
+
+      if (res.success && res.accessToken) {
+        const fullUrl = `${window.location.origin}/verify/${doc.id}?access_token=${res.accessToken}`;
+        setCreatedTokenInfo({
+          token: res.accessToken,
+          expiresAt: res.expiresAt,
+          url: fullUrl,
+        });
+        addToast('Access Token Created', 'Expiring private access token generated successfully.');
+      } else {
+        addToast('Generation Failed', res.error || 'Could not create access token.', 'error');
+      }
+    } catch (err: any) {
+      addToast('Error', err?.message || 'Failed to create access token.', 'error');
+    } finally {
+      setIsCreatingToken(false);
+    }
+  };
+
+  if (!doc && (isSyncing || isLookingUp)) {
+    return (
+      <AppShell title="Loading Document...">
+        <div className="text-center py-20 max-w-md mx-auto space-y-4">
+          <div className="w-16 h-16 rounded-3xl bg-blue-50 flex items-center justify-center text-[#1F6FF0] mx-auto animate-pulse">
+            <RefreshCw className="w-8 h-8 animate-spin" />
+          </div>
+          <h2 className="text-xl font-bold text-[#1C1C1C]">Restoring Document Record...</h2>
+          <p className="text-xs text-stone-500">Checking on-chain registry on {activeNetworkConfig.name} for {id}...</p>
+        </div>
+      </AppShell>
+    );
+  }
 
   if (!doc) {
     return (
@@ -93,67 +333,152 @@ export const DocumentDetailsPage: React.FC = () => {
       setTimeout(() => setCopiedHash(false), 2000);
       addToast('SHA-256 Copied', 'Hash fingerprint copied to clipboard.');
     } else {
-      setCopiedQrLink(true);
-      setTimeout(() => setCopiedQrLink(false), 2000);
+      setCopiedVerifyUrl(true);
+      setTimeout(() => setCopiedVerifyUrl(false), 2000);
       addToast('Verification Link Copied', 'Public URL copied to clipboard.');
     }
   };
 
   const handleDownloadReceipt = () => {
-    const receiptData = {
-      notaryVaultVersion: '1.0.4',
-      generatedTimestamp: new Date().toISOString(),
-      document: {
-        id: doc.id,
-        name: doc.name,
-        type: doc.type,
-        owner: doc.owner,
-        issueDate: doc.issueDate,
-        expiryDate: doc.expiryDate || 'N/A',
-        registeredAt: doc.registeredAt,
-        sha256Digest: doc.sha256Hash,
-        status: doc.status,
-      },
-      notice: 'Cryptographic document verification receipt generated by NotaryVault client.'
-    };
+    downloadDocumentReceipt(doc, {
+      storageStatus: doc.fileSizeBytes ? 'verified' : 'pending',
+      blockchainStatus: doc.onChainStatus === 'registered' || doc.txHash ? 'confirmed' : 'pending',
+      emailStatus: 'not_requested',
+    });
+    addToast('Receipt Downloaded', 'Verifiable document metadata JSON receipt saved to your downloads.');
+  };
 
-    const blob = new Blob([JSON.stringify(receiptData, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `NotaryVault_Receipt_${doc.id}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const loadShares = async () => {
+    const session = getClientSession();
+    if (!session || !doc) return;
+    try {
+      const res = await listDocumentShares(doc.id, session.token);
+      if (res.success && res.shares) {
+        setActiveShares(res.shares);
+      }
+    } catch {}
+  };
 
-    addToast('Receipt Downloaded', 'Document metadata JSON receipt saved to your downloads.');
+  React.useEffect(() => {
+    loadShares();
+  }, [doc?.id]);
+
+  const handleRevokeShare = async (shareId: string) => {
+    const session = getClientSession();
+    if (!session || !doc) return;
+    try {
+      const res = await revokeDocumentShare(doc.id, shareId, session.token);
+      if (res.success) {
+        addToast('Share Revoked', 'External recipient access has been permanently revoked.', 'warning');
+        loadShares();
+      } else {
+        addToast('Revocation Failed', res.error || 'Could not revoke share.', 'error');
+      }
+    } catch (err: any) {
+      addToast('Revocation Error', err?.message || 'Failed to revoke share.', 'error');
+    }
   };
 
   const handleShareSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!recipient.trim() || !recipient.includes('@')) {
-      setShareError('Please enter a valid recipient email address.');
+    if (!doc) return;
+    setShareError('');
+    setShareDeliveryResult(null);
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!shareEmail.trim() || !emailRegex.test(shareEmail.trim())) {
+      setShareError('Please enter a valid recipient email address (e.g. counsel@external-law.com).');
       return;
     }
-    setShareError('');
+
+    if (!recipientConsent && sendPdfByEmail) {
+      setShareError('Please confirm recipient consent to receive this document notification.');
+      return;
+    }
+
     setIsSharing(true);
 
     try {
-      await shareDocument({
+      // 1. Authenticate owner session with cryptographic signature
+      let session = getClientSession();
+      const activeAddr = walletAddress?.toLowerCase();
+      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
+
+      if (!isSessionValid) {
+        if (walletStatus !== 'connected' || !provider || !walletAddress) {
+          addToast('Wallet Connection Required', 'Please connect your owner wallet to authorize document sharing.', 'warning');
+          setShareError('Owner wallet connection is required for cryptographic authorization.');
+          setIsSharing(false);
+          return;
+        }
+
+        const challenge = await requestAuthChallenge(walletAddress);
+        if (!challenge.success || !challenge.challengeText) {
+          throw new Error(challenge.error || 'Failed to obtain authentication challenge.');
+        }
+
+        const signer = await provider.getSigner();
+        const signature = await signer.signMessage(challenge.challengeText);
+
+        const verifyRes = await verifyAuthSignature({
+          address: walletAddress,
+          signature,
+          challengeId: challenge.challengeId,
+          challengeText: challenge.challengeText,
+        });
+
+        if (!verifyRes.success || !verifyRes.session) {
+          throw new Error(verifyRes.error || 'Cryptographic signature rejected by server.');
+        }
+        session = verifyRes.session;
+      }
+
+      if (!session) {
+        throw new Error('Authentication session could not be established.');
+      }
+
+      // 2. Dispatch sharing & server-side delivery with on-chain SHA-256 verification (Email only)
+      const res = await shareDocumentWithDelivery({
         documentId: doc.id,
-        recipient: recipient.trim(),
-        durationDays,
-        durationLabel,
+        sessionToken: session.token,
+        recipientEmail: shareEmail.trim(),
+        recipientMobile: undefined,
+        sendEmail: sendPdfByEmail,
+        sendSms: false,
+        expiryPolicy,
+        purpose: 'Verified Document Share',
+        recipientConsent,
       });
-      setShareModalOpen(false);
-      setRecipient('');
+
+      setShareDeliveryResult(res);
+
+      if (res.success) {
+        // Record in client activity context
+        const durationDisplay = expiryPolicy === 'never' ? 'No Fixed Expiry' : expiryPolicy;
+        await shareDocument({
+          documentId: doc.id,
+          recipient: shareEmail.trim() || 'Confidential Recipient',
+          durationDays: expiryPolicy === '1h' ? 0.04 : (expiryPolicy === '24h' ? 1 : (expiryPolicy === '7d' ? 7 : (expiryPolicy === '30d' ? 30 : (expiryPolicy === '90d' ? 90 : 365)))),
+          durationLabel: durationDisplay,
+        });
+
+        addToast('Document Shared', 'Document share reference created and email dispatched.');
+        loadShares();
+      } else {
+        setShareError(res.error || 'Failed to share document.');
+        addToast('Share Failed', res.error || 'Delivery failed.', 'error');
+      }
+    } catch (err: any) {
+      setShareError(err?.message || 'Authorization failed.');
+      addToast('Share Error', err?.message || 'Failed to dispatch document share.', 'error');
     } finally {
       setIsSharing(false);
     }
   };
 
-  const publicVerificationUrl = `${window.location.origin}/verify/${doc.id}`;
+  const publicVerificationUrl = buildPublicVerificationUrl(doc.id);
+  const regTime = formatRegistrationTimestamp(doc.registeredAt);
 
   return (
     <AppShell
@@ -205,18 +530,39 @@ export const DocumentDetailsPage: React.FC = () => {
                   </h2>
                   <StatusPill status={doc.status} />
                 </div>
-                <div className="flex items-center gap-2 mt-1.5 text-xs text-stone-500 font-mono">
+                <div className="flex items-center gap-2 mt-1.5 text-xs text-stone-500 font-mono flex-wrap">
                   <span>ID: {doc.id}</span>
                   <span>•</span>
                   <span>Type: {doc.type}</span>
                   <span>•</span>
-                  <span>Registered: {formatDate(doc.registeredAt)}</span>
+                  <span>Property: {doc.propertyId || 'Unassigned'}</span>
+                  <span>•</span>
+                  <span>Registered: {regTime.local}</span>
                 </div>
+                {doc.hasConflictWarning && (
+                  <div className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">Conflicting Ownership Claim Flagged:</span>{' '}
+                      {doc.conflictNotes || 'Multiple parties registered under this property parcel. Requires registrar audit.'}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 
             {/* Quick Action Buttons */}
             <div className="flex items-center gap-3">
+              {hasPdfLocally && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={<Download className="w-4 h-4" />}
+                  onClick={() => downloadLocalPDF(doc.id, doc.name)}
+                >
+                  Download PDF
+                </Button>
+              )}
               <Button
                 variant="secondary"
                 size="sm"
@@ -310,16 +656,188 @@ export const DocumentDetailsPage: React.FC = () => {
                   <div className="text-sm font-bold text-stone-900">{doc.expiryDate ? formatDate(doc.expiryDate) : 'Perpetual / Not Applicable'}</div>
                 </div>
 
-                <div className="p-4 bg-stone-50 rounded-xl border border-black/5">
-                  <div className="flex items-center gap-2 text-stone-500 font-medium mb-1">
-                    <FileText className="w-3.5 h-3.5" />
-                    <span>Original Source File</span>
+                {/* Private Original PDF Card with Server Authorization */}
+                <div className="p-4 bg-stone-50 rounded-xl border border-black/5 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-stone-700 font-semibold text-xs">
+                      <Lock className="w-4 h-4 text-[#1F6FF0]" />
+                      <span>Private Original PDF (Server Authorization Protected)</span>
+                    </div>
+                    {hasPdfLocally ? (
+                      <span className="text-[10px] font-semibold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full border border-emerald-200">
+                        Available in Local Storage
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-semibold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full border border-amber-200">
+                        Off-Chain Storage
+                      </span>
+                    )}
                   </div>
+
                   <div className="text-sm font-bold text-stone-900 truncate">
-                    {doc.fileName} <span className="font-normal text-stone-400">({formatFileSize(doc.fileSizeBytes)})</span>
+                    {doc.fileName}{' '}
+                    <span className="font-normal text-stone-400 text-xs">
+                      ({doc.fileSizeBytes ? formatFileSize(doc.fileSizeBytes) : 'Size unrecorded'}
+                      {doc.pageCount ? ` • ${doc.pageCount} page(s)` : ''})
+                    </span>
+                  </div>
+
+                  <p className="text-[11px] text-stone-500 leading-relaxed">
+                    Access to original document bytes requires server-side authentication. Unauthenticated requests and unauthorized third parties are strictly blocked.
+                  </p>
+
+                  {/* Integrity Verification Result Banner */}
+                  {downloadResult?.success && (
+                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex items-start gap-2">
+                      <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold block">Integrity Verified:</span>
+                        <p className="text-[11px] text-emerald-800">
+                          Downloaded PDF SHA-256 matches on-chain baseline ({downloadResult.computedHash?.slice(0, 16)}...). Delivered from {downloadResult.source === 'backend' ? 'local storage server' : 'local device store'}.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {downloadResult?.isTampered && (
+                    <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-900 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold block text-red-950">Integrity Failure / Tamper Alert:</span>
+                        <p className="text-[11px] text-red-800">
+                          {downloadResult.error}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {downloadResult && !downloadResult.success && !downloadResult.isTampered && (
+                    <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-900 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                      <div>
+                        <span className="font-bold block">Access Denied / Download Error:</span>
+                        <p className="text-[11px] text-rose-800">
+                          {downloadResult.error}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="pt-1 flex flex-wrap items-center gap-2.5">
+                    <Button
+                      id="owner-download-verified-pdf-btn"
+                      type="button"
+                      variant="primary-app"
+                      size="sm"
+                      loading={isDownloading}
+                      icon={<Download className="w-3.5 h-3.5" />}
+                      onClick={handleAuthenticatedDownload}
+                      className="text-xs"
+                    >
+                      Download Verified PDF (Signed Auth)
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      icon={<Key className="w-3.5 h-3.5 text-stone-600" />}
+                      onClick={() => {
+                        setCreatedTokenInfo(null);
+                        setAccessTokenModalOpen(true);
+                      }}
+                      className="text-xs"
+                    >
+                      Create Private Access Link
+                    </Button>
                   </div>
                 </div>
               </div>
+
+              {/* Local Storage Disclaimer Banner */}
+              <div className="mt-4 p-3.5 bg-stone-50 rounded-xl border border-black/5 text-xs text-stone-600 flex items-start gap-2.5">
+                <ShieldCheck className="w-4 h-4 text-stone-400 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <span className="font-semibold text-stone-800 block">Browser Storage Notice:</span>
+                  <p className="text-[11px] leading-relaxed text-stone-500">
+                    {LOCAL_STORAGE_DISCLAIMER}
+                  </p>
+                </div>
+              </div>
+            </Card>
+
+            {/* Active Document Shares & Real-time Revocation (Requirement 4) */}
+            <Card className="p-6 space-y-4 border border-black/10">
+              <div className="flex items-center justify-between pb-3 border-b border-black/[0.06]">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg bg-blue-50 text-[#1F6FF0] flex items-center justify-center">
+                    <Share2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-bold text-[#1C1C1C]">
+                      Active External Shares & Expiry Policies
+                    </h3>
+                    <p className="text-[11px] text-stone-500">
+                      Manage cryptographic access links and revoke recipient permissions in real time.
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={loadShares}
+                  icon={<RefreshCw className="w-3.5 h-3.5" />}
+                  className="text-xs"
+                >
+                  Refresh
+                </Button>
+              </div>
+
+              {activeShares.length === 0 ? (
+                <div className="p-4 bg-stone-50/70 rounded-xl text-center text-xs text-stone-500">
+                  No active external shares recorded on the server for this document. Use <strong>Share Reference</strong> to deliver by email.
+                </div>
+              ) : (
+                <div className="divide-y divide-black/5 text-xs">
+                  {activeShares.map(sh => (
+                    <div key={sh.share_id} className="py-3 flex items-center justify-between gap-4 flex-wrap">
+                      <div className="space-y-0.5 min-w-[200px]">
+                        <div className="font-semibold text-stone-900 flex items-center gap-1.5">
+                          {sh.recipient_email ? (
+                            <span className="flex items-center gap-1"><Mail className="w-3.5 h-3.5 text-stone-400" />{sh.recipient_email}</span>
+                          ) : sh.recipient_mobile ? (
+                            <span className="flex items-center gap-1"><Phone className="w-3.5 h-3.5 text-stone-400" />{sh.recipient_mobile}</span>
+                          ) : (
+                            <span>Confidential Recipient</span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-stone-500 flex items-center gap-2">
+                          <span>Policy: <strong className="text-stone-700">{sh.access_policy === 'never' ? 'No Fixed Expiry' : sh.access_policy}</strong></span>
+                          <span>•</span>
+                          <span>Expires: {sh.expires_at ? formatDate(sh.expires_at) : 'Never (Manual Revocation Only)'}</span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {sh.is_revoked ? (
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-700">
+                            Revoked
+                          </span>
+                        ) : (
+                          <Button
+                            variant="danger"
+                            size="sm"
+                            className="text-[11px] py-1 px-2.5 h-auto"
+                            onClick={() => handleRevokeShare(sh.share_id)}
+                          >
+                            Revoke Access
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </Card>
 
             {/* MST Chain Testnet Smart Contract Registry Card */}
@@ -371,6 +889,16 @@ export const DocumentDetailsPage: React.FC = () => {
                       <span className="text-stone-400 block mb-0.5 font-medium">Block Height</span>
                       <span className="font-mono font-bold text-stone-900">#{doc.blockNumber || 'Mined'}</span>
                     </div>
+                  </div>
+
+                  <div className="p-3 bg-stone-50 rounded-xl border border-black/5">
+                    <span className="text-stone-400 block mb-0.5 font-medium">On-Chain Registration Timestamp</span>
+                    <span className="font-bold text-stone-900 block">{regTime.local}</span>
+                    {regTime.isValid && (
+                      <span className="text-[10px] text-stone-500 block mt-0.5 font-mono">
+                        {regTime.timezoneLabel} • {regTime.utc}
+                      </span>
+                    )}
                   </div>
 
                   {doc.txHash && (
@@ -551,42 +1079,52 @@ export const DocumentDetailsPage: React.FC = () => {
 
           </div>
 
-          {/* Right: Public QR Card & Sharing Reference (4 cols) */}
+          {/* Right: Public Verification & Sharing Reference (4 cols) */}
           <div className="lg:col-span-4 space-y-6">
             
-            {/* Public QR Card */}
+            {/* Public Verification Reference Card */}
             <Card className="p-6 text-center space-y-4 bg-white border border-black/[0.08]">
               <div>
-                <h4 className="text-sm font-bold text-[#1C1C1C]">
-                  Public Verification QR Code
+                <h4 className="text-sm font-bold text-[#1C1C1C] flex items-center justify-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-[#1F6FF0]" />
+                  <span>Public Verification Reference</span>
                 </h4>
                 <p className="text-xs text-stone-500 mt-0.5">
-                  Scan to inspect public status without revealing private contents.
+                  Direct lookup link to inspect on-chain registration status without exposing private PDF contents.
                 </p>
               </div>
 
-              <div className="p-4 bg-white rounded-2xl border border-black/10 inline-block shadow-sm">
-                <QRCodeSVG value={publicVerificationUrl} size={160} />
+              {/* Display Canonical Document ID */}
+              <div className="p-4 bg-stone-50/70 rounded-2xl border border-black/5 flex flex-col items-center gap-2">
+                <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider block">
+                  Canonical Document ID
+                </span>
+                <span className="font-mono text-base font-bold text-stone-900 bg-white px-3 py-1.5 rounded-lg border border-black/10 inline-block select-all shadow-2xs">
+                  {doc.id}
+                </span>
+                <span className="text-[11px] text-stone-500 max-w-xs">
+                  Anyone can enter this Document ID at <span className="font-mono font-medium text-stone-800">/verify</span> to check the blockchain record.
+                </span>
               </div>
 
-              <div className="p-3 bg-stone-50 rounded-xl text-left border border-black/5 text-xs text-stone-600 font-mono break-all">
+              <div className="p-3 bg-stone-50 rounded-xl text-left border border-black/5 text-xs text-stone-600 font-mono break-all select-all">
                 {publicVerificationUrl}
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <Button
                   variant="secondary"
                   size="sm"
-                  className="flex-1 text-xs"
-                  icon={copiedQrLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                  className="text-xs"
+                  icon={copiedVerifyUrl ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
                   onClick={() => copyToClipboard(publicVerificationUrl, 'link')}
                 >
-                  {copiedQrLink ? 'Copied' : 'Copy URL'}
+                  {copiedVerifyUrl ? 'Copied' : 'Copy Verification URL'}
                 </Button>
                 <Button
                   variant="primary-app"
                   size="sm"
-                  className="flex-1 text-xs"
+                  className="text-xs"
                   icon={<ExternalLink className="w-3.5 h-3.5" />}
                   onClick={() => navigate(`/verify/${doc.id}`)}
                 >
@@ -595,7 +1133,7 @@ export const DocumentDetailsPage: React.FC = () => {
               </div>
 
               <div className="pt-2 text-[11px] text-stone-400 leading-snug">
-                * Public portal safely discloses only ID, document classification, timestamp, and verification badge.
+                * Public verification discloses only cryptographic digest, verification status, and timestamp. Raw PDF and private keys are never exposed.
               </div>
             </Card>
 
@@ -622,65 +1160,235 @@ export const DocumentDetailsPage: React.FC = () => {
       {/* =========================================================================
           SHARE MODAL (Document Reference Sharing)
           ========================================================================= */}
+      {/* =========================================================================
+          SHARE & MULTI-CHANNEL DELIVERY MODAL
+          ========================================================================= */}
       <Modal
         isOpen={shareModalOpen}
-        onClose={() => setShareModalOpen(false)}
-        title="Share Document Reference"
-        subtitle={`Grant time-limited inspection access for "${doc.name}"`}
+        onClose={() => { setShareModalOpen(false); setShareDeliveryResult(null); }}
+        title="Share Document & Send Delivery"
+        subtitle={`Send verified PDF or grant secure inspection access for "${doc.name}"`}
       >
-        <form onSubmit={handleShareSubmit} className="space-y-5">
-          <Input
-            label="Recipient Email Address *"
-            placeholder="e.g. counsel@external-law.com or auditor@bank.org"
-            value={recipient}
-            onChange={(e) => setRecipient(e.target.value)}
-            error={shareError}
-          />
+        <form onSubmit={handleShareSubmit} className="space-y-4">
+          
+          {/* Active Email Delivery Channel */}
+          <div className="space-y-3">
+            <div className="p-3.5 bg-blue-50/50 rounded-xl border border-[#1F6FF0]/30 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Mail className="w-4 h-4 text-[#1F6FF0]" />
+                  <span className="text-xs font-bold text-stone-900">Email Delivery (PDF Attachment)</span>
+                </div>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                  Active
+                </span>
+              </div>
+              <label className="flex items-start gap-2.5 cursor-pointer text-xs text-stone-800">
+                <input
+                  id="send-email-checkbox"
+                  type="checkbox"
+                  checked={sendPdfByEmail}
+                  onChange={(e) => setSendPdfByEmail(e.target.checked)}
+                  className="mt-0.5 rounded border-stone-300 text-[#1F6FF0] focus:ring-[#1F6FF0]"
+                />
+                <div>
+                  <span className="font-semibold block text-stone-900">Send PDF as Email Attachment</span>
+                  <span className="text-[11px] text-stone-600">
+                    The server retrieves the original PDF from private storage, verifies SHA-256 integrity against on-chain records, and attaches it directly to the email.
+                  </span>
+                </div>
+              </label>
+            </div>
 
-          <div>
-            <label className="block text-xs font-semibold text-stone-700 uppercase tracking-wider mb-2">
-              Access Duration
-            </label>
-            <div className="space-y-2">
-              <OptionRow
-                label="24 Hours (Immediate Audit)"
-                selected={durationDays === 1}
-                onClick={() => { setDurationDays(1); setDurationLabel('24 Hours'); }}
+            {/* Recipient Email with Prefill */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider">
+                  Recipient Email Address *
+                </label>
+                {doc.ownerEmail && (
+                  <button
+                    type="button"
+                    onClick={() => setShareEmail(doc.ownerEmail || '')}
+                    className="text-[11px] text-[#1F6FF0] hover:underline flex items-center gap-1 font-medium cursor-pointer"
+                  >
+                    <Mail className="w-3 h-3" />
+                    <span>Prefill from Owner Record</span>
+                  </button>
+                )}
+              </div>
+              <Input
+                id="share-recipient-email-input"
+                placeholder="e.g. counsel@external-law.com or auditor@bank.org"
+                value={shareEmail}
+                onChange={(e) => setShareEmail(e.target.value)}
               />
-              <OptionRow
-                label="7 Days (Standard Review)"
-                selected={durationDays === 7}
-                onClick={() => { setDurationDays(7); setDurationLabel('7 Days'); }}
-              />
-              <OptionRow
-                label="30 Days (Extended Due Diligence)"
-                selected={durationDays === 30}
-                onClick={() => { setDurationDays(30); setDurationLabel('30 Days'); }}
-              />
+            </div>
+
+            {/* Mobile Sharing — Coming Soon */}
+            <div 
+              id="mobile-sharing-coming-soon-card"
+              className="p-3.5 bg-stone-100/70 rounded-xl border border-dashed border-stone-300 space-y-2 opacity-85 select-none"
+              aria-disabled="true"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-base select-none" aria-hidden="true">📱</span>
+                  <span className="text-xs font-bold text-stone-700">Mobile Sharing</span>
+                </div>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-stone-200 text-stone-600 border border-stone-300">
+                  Coming Soon
+                </span>
+              </div>
+              <p className="text-[11px] text-stone-500 leading-relaxed">
+                Share documents securely via mobile number and SMS. This feature will be available in a future update.
+              </p>
+              <div className="space-y-1 pt-1">
+                <input
+                  id="share-recipient-mobile-input-disabled"
+                  type="text"
+                  disabled
+                  readOnly
+                  placeholder="Recipient Mobile Number (Disabled — Coming Soon)"
+                  className="w-full text-xs bg-stone-200/50 text-stone-400 border border-stone-300 rounded-lg py-2 px-3 cursor-not-allowed select-none opacity-70"
+                />
+              </div>
             </div>
           </div>
 
-          <div className="p-3 bg-stone-100 rounded-xl border border-black/5 text-xs text-stone-700 leading-relaxed">
-            <span className="font-bold">Sharing Notice:</span> Creating a share reference records an audit entry and prepares a verifiable access link for this document.
+          {/* Access Policy Selection (Removing hardcoded 30-day limit!) */}
+          <div>
+            <label className="block text-xs font-semibold text-stone-700 uppercase tracking-wider mb-2">
+              Access Expiry Policy
+            </label>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              {[
+                { key: '1h', label: '1 Hour' },
+                { key: '24h', label: '24 Hours' },
+                { key: '7d', label: '7 Days' },
+                { key: '30d', label: '30 Days' },
+                { key: '90d', label: '90 Days' },
+                { key: 'never', label: 'No Fixed Expiry' },
+              ].map((opt) => (
+                <button
+                  key={opt.key}
+                  type="button"
+                  onClick={() => setExpiryPolicy(opt.key as any)}
+                  className={`p-2.5 text-xs font-semibold rounded-xl border text-center transition-all cursor-pointer ${
+                    expiryPolicy === opt.key
+                      ? 'bg-blue-50 border-[#1F6FF0] text-[#1F6FF0] shadow-xs'
+                      : 'bg-white border-black/10 text-stone-700 hover:bg-stone-50'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            {expiryPolicy === 'never' && (
+              <p className="text-[11px] text-stone-500 mt-1.5 leading-tight">
+                * No-expiry links remain subject to server-side cryptographic authorization and can be revoked by the owner at any time.
+              </p>
+            )}
           </div>
+
+          {/* Consent Checkbox */}
+          <label className="flex items-center gap-2 cursor-pointer text-xs text-stone-700 pt-1">
+            <input
+              type="checkbox"
+              checked={recipientConsent}
+              onChange={(e) => setRecipientConsent(e.target.checked)}
+              className="rounded border-stone-300 text-[#1F6FF0] focus:ring-[#1F6FF0]"
+            />
+            <span>I confirm recipient consent to receive this document notification.</span>
+          </label>
+
+          {shareError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <span>{shareError}</span>
+            </div>
+          )}
+
+          {/* Delivery Status Card after Send */}
+          {shareDeliveryResult && (
+            <div className="p-4 bg-stone-50 rounded-xl border border-black/10 space-y-3">
+              <div className="flex items-center gap-2 text-xs font-bold text-stone-900">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                <span>Share Reference Generated</span>
+              </div>
+
+              {/* Email Status */}
+              {sendPdfByEmail && (
+                <div className="flex items-center justify-between text-xs p-2.5 bg-white rounded-lg border border-black/5">
+                  <span className="font-semibold text-stone-700 flex items-center gap-1.5">
+                    <Mail className="w-3.5 h-3.5 text-stone-500" />
+                    <span>Email Delivery:</span>
+                  </span>
+                  <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                    shareDeliveryResult.emailDelivery?.status === 'accepted'
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
+                      ? 'bg-amber-100 text-amber-800'
+                      : 'bg-rose-100 text-rose-800'
+                  }`}>
+                    {shareDeliveryResult.emailDelivery?.status === 'accepted'
+                      ? 'Accepted by Provider'
+                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
+                      ? 'Provider Not Configured'
+                      : 'Delivery Failed'}
+                  </span>
+                </div>
+              )}
+
+              {/* Secure Link */}
+              {shareDeliveryResult.secureAccessUrl && (
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
+                    Secure Access URL
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <input
+                      readOnly
+                      value={shareDeliveryResult.secureAccessUrl}
+                      className="flex-1 text-xs font-mono bg-white p-2 rounded border border-black/10 select-all"
+                    />
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      icon={copiedShareLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      onClick={() => {
+                        navigator.clipboard.writeText(shareDeliveryResult.secureAccessUrl || '');
+                        setCopiedShareLink(true);
+                        setTimeout(() => setCopiedShareLink(false), 2000);
+                      }}
+                    >
+                      {copiedShareLink ? 'Copied' : 'Copy'}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/[0.06]">
             <Button
               type="button"
               variant="secondary"
               size="sm"
-              onClick={() => setShareModalOpen(false)}
+              onClick={() => { setShareModalOpen(false); setShareDeliveryResult(null); }}
             >
-              Cancel
+              Close
             </Button>
             <Button
+              id="send-document-submit-btn"
               type="submit"
               variant="primary-app"
               size="sm"
               loading={isSharing}
-              icon={<Share2 className="w-4 h-4" />}
+              icon={<Send className="w-4 h-4" />}
             >
-              Create Share Reference
+              Send Document
             </Button>
           </div>
         </form>
@@ -768,6 +1476,139 @@ export const DocumentDetailsPage: React.FC = () => {
               Confirm & Broadcast to Mainnet
             </Button>
           </div>
+        </div>
+      </Modal>
+
+      {/* Private Access Token Modal */}
+      <Modal
+        isOpen={accessTokenModalOpen}
+        onClose={() => setAccessTokenModalOpen(false)}
+        title="Create Expiring Private Access Link"
+        subtitle="Grant time-limited, revocable access to the confidential original PDF."
+      >
+        <div className="space-y-4 text-xs">
+          {!createdTokenInfo ? (
+            <>
+              <div className="p-3.5 bg-blue-50/80 border border-blue-200 rounded-2xl text-blue-950 space-y-1">
+                <div className="font-bold flex items-center gap-1.5 text-blue-900">
+                  <Lock className="w-4 h-4 text-blue-600" />
+                  <span>Cryptographically Signed Access Token</span>
+                </div>
+                <p className="text-[11px] leading-relaxed">
+                  Generating this token creates a secure random token in the private storage server database. The recipient can download the verified original PDF until expiration. You may revoke access at any time.
+                </p>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="block font-semibold text-stone-700">Token Validity Duration</label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {[
+                    { label: '1 Hour', hours: 1 },
+                    { label: '24 Hours', hours: 24 },
+                    { label: '7 Days', hours: 168 },
+                    { label: '30 Days', hours: 720 },
+                  ].map((dur) => (
+                    <button
+                      key={dur.hours}
+                      type="button"
+                      onClick={() => setTokenDurationHours(dur.hours)}
+                      className={`py-2 px-3 rounded-xl border text-center font-medium cursor-pointer transition-all ${
+                        tokenDurationHours === dur.hours
+                          ? 'bg-[#1F6FF0] text-white border-[#1F6FF0]'
+                          : 'bg-stone-50 border-black/10 text-stone-700 hover:bg-stone-100'
+                      }`}
+                    >
+                      {dur.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="block font-semibold text-stone-700">Access Purpose / Notes (Optional)</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Bank Mortgage Due Diligence"
+                  value={tokenPurpose}
+                  onChange={(e) => setTokenPurpose(e.target.value)}
+                  className="w-full px-3 py-2 bg-stone-50 border border-black/10 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-[#1F6FF0]/30"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-black/5">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setAccessTokenModalOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="primary-app"
+                  size="sm"
+                  loading={isCreatingToken}
+                  onClick={handleCreateAccessToken}
+                  icon={<Key className="w-3.5 h-3.5" />}
+                >
+                  Generate Access Token
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-2xl text-emerald-950 space-y-2">
+                <div className="font-bold flex items-center gap-1.5 text-emerald-900">
+                  <Check className="w-4 h-4 text-emerald-600" />
+                  <span>Private Access Link Generated</span>
+                </div>
+                <p className="text-[11px] leading-relaxed">
+                  Share this link with authorized parties. Access expires automatically on{' '}
+                  <strong>{createdTokenInfo.expiresAt ? formatDateTime(createdTokenInfo.expiresAt) : 'designated expiry'}</strong>.
+                </p>
+              </div>
+
+              <div className="space-y-1.5">
+                <span className="font-semibold text-stone-700 block">Private Access URL</span>
+                <div className="p-2.5 bg-stone-50 rounded-xl border border-black/10 font-mono text-[11px] text-stone-800 break-all select-all">
+                  {createdTokenInfo.url}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <span className="font-semibold text-stone-700 block">Token Secret</span>
+                <div className="p-2 bg-white rounded-lg border border-black/5 font-mono text-[10px] text-stone-600 break-all select-all">
+                  {createdTokenInfo.token}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-black/5">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  icon={copiedPrivateLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                  onClick={() => {
+                    navigator.clipboard.writeText(createdTokenInfo.url);
+                    setCopiedPrivateLink(true);
+                    setTimeout(() => setCopiedPrivateLink(false), 2000);
+                    addToast('Copied Link', 'Private access link copied to clipboard.');
+                  }}
+                >
+                  {copiedPrivateLink ? 'Copied' : 'Copy Private Link'}
+                </Button>
+                <Button
+                  type="button"
+                  variant="primary-app"
+                  size="sm"
+                  onClick={() => setAccessTokenModalOpen(false)}
+                >
+                  Done
+                </Button>
+              </div>
+            </>
+          )}
         </div>
       </Modal>
 

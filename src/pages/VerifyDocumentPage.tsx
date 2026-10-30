@@ -7,7 +7,7 @@ import { Input } from '../components/ui/Input';
 import { StatusPill } from '../components/ui/StatusPill';
 import { useDocuments } from '../context/DocumentContext';
 import { useWallet } from '../context/WalletContext';
-import { getExplorerTxUrl } from '../services/contractService';
+import { getExplorerTxUrl, getExplorerAddressUrl } from '../services/contractService';
 import type { VerificationCheckResult } from '../types';
 import { 
   ShieldCheck, 
@@ -21,10 +21,12 @@ import {
   Copy, 
   Check, 
   ArrowRight,
-  ExternalLink
+  ExternalLink,
+  Info
 } from 'lucide-react';
 import { computeFileSHA256, truncateHash } from '../lib/hash';
 import { formatFileSize } from '../lib/format';
+import { validatePdfFile, PDF_SIZE_NOTICE } from '../lib/pdfValidator';
 
 export const VerifyDocumentPage: React.FC = () => {
   const [searchParams] = useSearchParams();
@@ -71,13 +73,21 @@ export const VerifyDocumentPage: React.FC = () => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // Validate PDF and maximum 50 MB size limit
+    const validation = await validatePdfFile(file, file.name);
+    if (!validation.valid) {
+      addToast('Invalid PDF', validation.error || 'Please provide a valid PDF file.', 'error');
+      if (e.target) e.target.value = '';
+      return;
+    }
+
     setSelectedFile(file);
     setIsVerifying(true);
 
     try {
       const hash = await computeFileSHA256(file);
       setComputedFileHash(hash);
-      await new Promise(resolve => setTimeout(resolve, 600));
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       const res = await verifyDocument(documentIdInput.trim() || undefined, file, selectedNetwork);
       setVerificationResult(res);
@@ -193,17 +203,28 @@ export const VerifyDocumentPage: React.FC = () => {
             <div className="space-y-4">
               <div>
                 <label className="block text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5">
-                  Select File for Client SHA-256 Check
+                  Select PDF Document for Client SHA-256 Check
                 </label>
-                <p className="text-xs text-stone-500 mb-3">
-                  Upload an original or modified document. The browser will hash it instantly and cross-reference catalog records.
+                <p className="text-xs text-stone-500 mb-2">
+                  Upload an original or suspected PDF document. The browser will compute its exact SHA-256 hash client-side and cross-reference blockchain records.
                 </p>
+
+                {/* Requirement: Notice near upload control */}
+                <div className="p-3 bg-blue-50/70 border border-blue-200/70 rounded-xl flex items-center justify-between text-xs text-blue-900 mb-3">
+                  <div className="flex items-center gap-1.5">
+                    <Info className="w-4 h-4 text-blue-600 shrink-0" />
+                    <span className="font-semibold">{PDF_SIZE_NOTICE}</span>
+                  </div>
+                  <span className="text-[11px] font-mono bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-bold">
+                    PDF format only
+                  </span>
+                </div>
 
                 <input
                   type="file"
                   ref={fileInputRef}
                   onChange={handleFileSelected}
-                  accept=".pdf,.png,.jpg,.jpeg"
+                  accept="application/pdf,.pdf"
                   className="hidden"
                 />
 
@@ -332,6 +353,39 @@ export const VerifyDocumentPage: React.FC = () => {
                             Smart Contract Verified
                           </span>
                         </div>
+                        {/* Registry Origin & Contract Details */}
+                        {(() => {
+                          const contractAddr = verificationResult.contractAddress || verificationResult.document?.contractAddress;
+                          const isHist = Boolean(
+                            verificationResult.isHistorical || 
+                            (contractAddr && contractAddr.toLowerCase() === '0xe9097672c2556318f1bd974323174baa43b88514'.toLowerCase())
+                          );
+                          return (
+                            <div className="space-y-1 pt-1 border-t border-emerald-200/50">
+                              <div className="flex items-center justify-between text-[11px]">
+                                <span className="text-stone-500">Registry Source:</span>
+                                <span className="font-semibold text-emerald-900">
+                                  {isHist ? 'Historical Registry (v1 fallback)' : 'Active Registry (v2)'}
+                                </span>
+                              </div>
+                              {contractAddr && (
+                                <div className="flex items-center justify-between text-[11px]">
+                                  <span className="text-stone-500">Contract:</span>
+                                  <a
+                                    href={getExplorerAddressUrl(contractAddr, verificationResult.networkKey || selectedNetwork)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="font-mono text-emerald-800 hover:underline inline-flex items-center gap-1"
+                                  >
+                                    <span className="truncate max-w-[200px]">{contractAddr}</span>
+                                    <ExternalLink className="w-3 h-3" />
+                                  </a>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
+
                         {verificationResult.onChainRegistrant && (
                           <div className="text-[11px] text-stone-600">
                             Registrant Wallet: <span className="font-mono text-stone-800 font-medium">{verificationResult.onChainRegistrant}</span>
@@ -355,6 +409,16 @@ export const VerifyDocumentPage: React.FC = () => {
                         )}
                       </div>
                     )}
+
+                    {/* Legal Integrity Disclaimer */}
+                    <div className="p-3 bg-stone-50 rounded-xl border border-black/5 text-[11px] text-stone-600 space-y-1">
+                      <p>
+                        <strong>Integrity Notice:</strong> A matching hash confirms file integrity relative to the recorded hash. It does not independently establish legal authenticity, legal ownership, or the real-world identity of the registrant.
+                      </p>
+                      <p className="text-stone-400 text-[10px]">
+                        Public verification protects confidentiality and never exposes original PDF contents or sensitive personal data.
+                      </p>
+                    </div>
                   </div>
                 )}
 

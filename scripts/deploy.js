@@ -208,8 +208,10 @@ async function main() {
   const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
   console.log(`\nDeploying NotaryVaultRegistry contract to ${targetConfig.name}...`);
 
+  const superAuthorAddress = process.env.SUPER_AUTHOR_ADDRESS?.trim() || deployerAddress;
+  console.log(`Initial Super Author authority: ${superAuthorAddress}`);
   const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
-  const contract = await factory.deploy();
+  const contract = await factory.deploy(superAuthorAddress);
   const deployTx = contract.deploymentTransaction();
   console.log(`Deployment transaction submitted: ${deployTx?.hash}`);
 
@@ -280,6 +282,22 @@ async function main() {
     }
   }
 
+  const prevContractAddr = deploymentData[networkKey]?.contractAddress;
+  let historicalDeployments = deploymentData[networkKey]?.historicalDeployments || [];
+  if (prevContractAddr && ethers.isAddress(prevContractAddr) && prevContractAddr.toLowerCase() !== contractAddress.toLowerCase()) {
+    historicalDeployments = [
+      {
+        version: deploymentData[networkKey]?.version || `v${historicalDeployments.length + 1}`,
+        contractAddress: prevContractAddr,
+        deploymentTxHash: deploymentData[networkKey]?.deploymentTxHash || '',
+        deployedAtBlock: deploymentData[networkKey]?.deployedAtBlock || null,
+        deployerAddress: deploymentData[networkKey]?.deployerAddress || '',
+        deployedAt: deploymentData[networkKey]?.deployedAt || '',
+      },
+      ...historicalDeployments,
+    ];
+  }
+
   // Update ONLY the target network deployment, strictly preserving the other
   deploymentData[networkKey] = {
     network: targetConfig.name,
@@ -294,6 +312,8 @@ async function main() {
     deployerAddress,
     deployed: true,
     deployedAt: new Date().toISOString(),
+    previousContractAddress: prevContractAddr || '',
+    historicalDeployments,
   };
 
   // Keep top-level keys for backwards compatibility with default testnet
@@ -310,11 +330,14 @@ async function main() {
     deployerAddress: deploymentData.testnet.deployerAddress,
     deployed: deploymentData.testnet.deployed,
     deployedAt: deploymentData.testnet.deployedAt,
+    previousContractAddress: deploymentData.testnet.previousContractAddress,
+    historicalDeployments: deploymentData.testnet.historicalDeployments,
   });
 
   fs.writeFileSync(deploymentPath, JSON.stringify(deploymentData, null, 2), 'utf8');
   console.log(`✔ Saved updated deployment record for ${targetConfig.name} to ${deploymentPath}`);
-  console.log(`✔ Verified: Testnet address preserved as "${deploymentData.testnet.contractAddress}"`);
+  console.log(`✔ Verified: Active Testnet address set as "${deploymentData.testnet.contractAddress}"`);
+  console.log(`✔ Verified: Previous Testnet address preserved as "${deploymentData.testnet.previousContractAddress}"`);
   console.log(`✔ Verified: Mainnet address saved as "${deploymentData.mainnet.contractAddress}"`);
 }
 

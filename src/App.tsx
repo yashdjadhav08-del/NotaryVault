@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { WalletProvider } from './context/WalletContext';
 import { DocumentProvider } from './context/DocumentContext';
+import { AuthorProvider } from './context/AuthorContext';
 import { ToastContainer } from './components/ui/Toast';
 
 // Pages
@@ -15,6 +16,9 @@ import { SharedDocumentsPage } from './pages/SharedDocumentsPage';
 import { ActivityHistoryPage } from './pages/ActivityHistoryPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { QRVerificationPage } from './pages/QRVerificationPage';
+import { ApplyAuthorPage } from './pages/ApplyAuthorPage';
+import { AuthorApplicationsPage } from './pages/AuthorApplicationsPage';
+import { AuthorManagementPage } from './pages/AuthorManagementPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 // Scroll to top on route change
@@ -32,32 +36,40 @@ export function App() {
   return (
     <WalletProvider>
       <DocumentProvider>
-        <BrowserRouter>
-          <ScrollToTop />
-          <Routes>
-            {/* Public Landing Page */}
-            <Route path="/" element={<LandingPage />} />
+        <AuthorProvider>
+          <BrowserRouter>
+            <ScrollToTop />
+            <Routes>
+              {/* Public Landing Page */}
+              <Route path="/" element={<LandingPage />} />
 
-            {/* Public QR Verification Portal */}
-            <Route path="/verify/:documentId" element={<QRVerificationPage />} />
+              {/* Public Verification Portal */}
+              <Route path="/verify" element={<QRVerificationPage />} />
+              <Route path="/verify/:documentId" element={<QRVerificationPage />} />
 
-            {/* In-App Pages */}
-            <Route path="/app" element={<DashboardPage />} />
-            <Route path="/app/documents" element={<DocumentLibraryPage />} />
-            <Route path="/app/documents/:id" element={<DocumentDetailsPage />} />
-            <Route path="/app/register" element={<RegisterDocumentPage />} />
-            <Route path="/app/verify" element={<VerifyDocumentPage />} />
-            <Route path="/app/shared" element={<SharedDocumentsPage />} />
-            <Route path="/app/activity" element={<ActivityHistoryPage />} />
-            <Route path="/app/settings" element={<SettingsPage />} />
+              {/* In-App Pages */}
+              <Route path="/app" element={<DashboardPage />} />
+              <Route path="/app/documents" element={<DocumentLibraryPage />} />
+              <Route path="/app/documents/:id" element={<DocumentDetailsPage />} />
+              <Route path="/app/register" element={<RegisterDocumentPage />} />
+              <Route path="/app/verify" element={<VerifyDocumentPage />} />
+              <Route path="/app/shared" element={<SharedDocumentsPage />} />
+              <Route path="/app/activity" element={<ActivityHistoryPage />} />
+              <Route path="/app/settings" element={<SettingsPage />} />
 
-            {/* 404 Route */}
-            <Route path="*" element={<NotFoundPage />} />
-          </Routes>
+              {/* Author Role & Management Pages */}
+              <Route path="/app/apply-author" element={<ApplyAuthorPage />} />
+              <Route path="/app/author-applications" element={<AuthorApplicationsPage />} />
+              <Route path="/app/authors" element={<AuthorManagementPage />} />
 
-          {/* Global Toast Notifications */}
-          <ToastContainer />
-        </BrowserRouter>
+              {/* 404 Route */}
+              <Route path="*" element={<NotFoundPage />} />
+            </Routes>
+
+            {/* Global Toast Notifications */}
+            <ToastContainer />
+          </BrowserRouter>
+        </AuthorProvider>
       </DocumentProvider>
     </WalletProvider>
   );

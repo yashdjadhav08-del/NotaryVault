@@ -12,13 +12,17 @@ import {
   Share2, 
   ShieldCheck, 
   PlusCircle, 
-  ArrowRight
+  ArrowRight,
+  RefreshCw,
+  AlertCircle
 } from 'lucide-react';
 import { formatRelativeTime } from '../lib/format';
+import { useWallet } from '../context/WalletContext';
 
 export const DashboardPage: React.FC = () => {
   const navigate = useNavigate();
-  const { documents, sharedRecords, activities } = useDocuments();
+  const { documents, sharedRecords, activities, isSyncing, syncError, syncWithBlockchain } = useDocuments();
+  const { selectedNetwork, activeNetworkConfig } = useWallet();
 
   const totalDocs = documents.length;
   const verifiedDocs = documents.filter(d => d.status === 'Verified').length;
@@ -34,6 +38,15 @@ export const DashboardPage: React.FC = () => {
       subtitle="Overview of registered property deeds, verification statuses, and active access links."
       actions={
         <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin text-blue-600' : 'text-stone-500'}`} />}
+            onClick={() => syncWithBlockchain(selectedNetwork, true)}
+            title="Sync and restore records from MST Chain"
+          >
+            {isSyncing ? 'Syncing...' : 'Sync On-Chain'}
+          </Button>
           <Button
             variant="secondary"
             size="sm"
@@ -55,6 +68,24 @@ export const DashboardPage: React.FC = () => {
     >
       <div className="space-y-8">
         
+        {/* Sync Error Banner if applicable */}
+        {syncError && (
+          <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-between text-xs text-amber-900 gap-3">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>
+                On-chain sync warning for {activeNetworkConfig.name}: {syncError}. Local records are preserved.
+              </span>
+            </div>
+            <button
+              onClick={() => syncWithBlockchain(selectedNetwork, true)}
+              className="text-xs font-semibold text-amber-800 underline hover:text-amber-950 shrink-0 cursor-pointer"
+            >
+              Retry Sync
+            </button>
+          </div>
+        )}
+
         {/* Stat Cards Grid (Derived from embedded mini-UI design tokens) */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
           

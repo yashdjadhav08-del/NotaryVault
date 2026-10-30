@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 import type { 
   DocumentRecord, 
@@ -14,19 +14,36 @@ import {
   saveSharedRecords, 
   loadActivities, 
   saveActivities, 
+  mergeDocuments,
+  mergeActivities,
   resetDemoData as resetStorage 
 } from '../lib/storage';
-import { generateDocumentId, generateUUID } from '../lib/id';
-import { computeFileSHA256 } from '../lib/hash';
+import { 
+  generateUniqueDocumentId, 
+  generateUUID, 
+  normalizeDocumentId, 
+  isValidDocumentId 
+} from '../lib/id';
+import { computeFileSHA256, areSha256HashesEqual } from '../lib/hash';
+import { validatePdfFile } from '../lib/pdfValidator';
+import { 
+  saveLocalPDF, 
+  clearAllLocalPDFs, 
+  uploadPdfToServer, 
+  verifyServerStorage, 
+  confirmServerRegistration 
+} from '../lib/pdfStorage';
 import { 
   registerOnChain, 
   verifyOnChain, 
   revokeOnChain, 
-  isContractConfigured,
-  getOnChainDetails,
-  getOnChainIdByHash,
-  MST_NETWORKS,
-  type MSTNetworkKey
+  isContractConfigured, 
+  getOnChainDetails, 
+  getOnChainIdByHash, 
+  checkDocumentIdExists,
+  recoverOnChainRecords,
+  MST_NETWORKS, 
+  type MSTNetworkKey 
 } from '../services/contractService';
 
 export interface ToastMessage {
@@ -36,16 +53,21 @@ export interface ToastMessage {
   message: string;
 }
 
-interface RegisterParams {
+export interface RegisterParams {
+  customId?: string;
   name: string;
   type: DocumentType;
   description: string;
   owner: string;
   issueDate: string;
   expiryDate?: string;
+  propertyId?: string;
   file: File;
   rawProvider?: any;
   networkKey?: MSTNetworkKey;
+  ownerEmail?: string;
+  ownerMobile?: string;
+  notificationConsent?: boolean;
 }
 
 interface ShareParams {
@@ -60,6 +82,9 @@ interface DocumentContextType {
   sharedRecords: SharedRecord[];
   activities: ActivityEvent[];
   toasts: ToastMessage[];
+  isSyncing: boolean;
+  syncError: string | null;
+  syncWithBlockchain: (networkKey?: MSTNetworkKey, force?: boolean) => Promise<{ recoveredCount: number; error?: string }>;
   addToast: (title: string, message: string, type?: 'success' | 'info' | 'warning' | 'error') => void;
   removeToast: (id: string) => void;
   registerDocument: (params: RegisterParams) => Promise<DocumentRecord>;
@@ -71,21 +96,105 @@ interface DocumentContextType {
   updateDocument: (id: string, updates: Partial<DocumentRecord>) => void;
   resetAllDemoData: () => void;
   getDocumentById: (id: string) => DocumentRecord | undefined;
+  getDocumentsByPropertyId: (propertyId: string) => DocumentRecord[];
+  checkPropertyConflicts: (propertyId: string, currentOwner: string) => { hasConflict: boolean; existingDocs: DocumentRecord[]; note?: string };
+  checkDocumentIdAvailability: (id: string, networkKey?: MSTNetworkKey) => Promise<{ available: boolean; source?: string; reason?: string; warning?: string }>;
+  generateAvailableDocumentId: (networkKey?: MSTNetworkKey) => Promise<string>;
 }
 
 const DocumentContext = createContext<DocumentContextType | undefined>(undefined);
 
 export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
-  const [sharedRecords, setSharedRecords] = useState<SharedRecord[]>([]);
-  const [activities, setActivities] = useState<ActivityEvent[]>([]);
+  // Synchronous initialization from localStorage ensures state is immediately populated on first render
+  const [documents, setDocuments] = useState<DocumentRecord[]>(() => loadDocuments());
+  const [sharedRecords, setSharedRecords] = useState<SharedRecord[]>(() => loadSharedRecords());
+  const [activities, setActivities] = useState<ActivityEvent[]>(() => loadActivities());
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
+  const isMountedRef = useRef<boolean>(true);
+
+  // Sync on mount and restore any missing on-chain documents / activities
   useEffect(() => {
-    setDocuments(loadDocuments());
-    setSharedRecords(loadSharedRecords());
-    setActivities(loadActivities());
+    isMountedRef.current = true;
+
+    // Background on-chain synchronization
+    syncWithBlockchain('testnet');
+
+    return () => {
+      isMountedRef.current = false;
+    };
   }, []);
+
+  /**
+   * Recovers and synchronizes on-chain registration records and event logs
+   * into the local application catalog.
+   */
+  const syncWithBlockchain = async (
+    networkKey: MSTNetworkKey = 'testnet',
+    force: boolean = false
+  ): Promise<{ recoveredCount: number; error?: string }> => {
+    if (isSyncing && !force) {
+      return { recoveredCount: 0 };
+    }
+
+    if (!isContractConfigured(networkKey)) {
+      return { recoveredCount: 0 };
+    }
+
+    setIsSyncing(true);
+    setSyncError(null);
+
+    try {
+      const recovered = await recoverOnChainRecords(networkKey);
+
+      if (recovered.error) {
+        if (isMountedRef.current) {
+          setSyncError(recovered.error);
+        }
+        return { recoveredCount: 0, error: recovered.error };
+      }
+
+      let restoredCount = 0;
+
+      if (recovered.documents.length > 0 || recovered.activities.length > 0) {
+        setDocuments(prev => {
+          const existingIds = new Set(prev.map(d => d.id.toUpperCase()));
+          const merged = mergeDocuments(prev, recovered.documents);
+          restoredCount = merged.filter(d => !existingIds.has(d.id.toUpperCase())).length;
+          saveDocuments(merged);
+          return merged;
+        });
+
+        setActivities(prev => {
+          const merged = mergeActivities(prev, recovered.activities);
+          saveActivities(merged);
+          return merged;
+        });
+
+        if (restoredCount > 0) {
+          addToast(
+            'On-Chain Records Restored',
+            `Restored ${restoredCount} document(s) and historical activity from ${MST_NETWORKS[networkKey].name}.`,
+            'info'
+          );
+        }
+      }
+
+      return { recoveredCount: restoredCount };
+    } catch (err: any) {
+      const errorMsg = err?.message || 'Failed to sync records from MST Chain.';
+      if (isMountedRef.current) {
+        setSyncError(errorMsg);
+      }
+      return { recoveredCount: 0, error: errorMsg };
+    } finally {
+      if (isMountedRef.current) {
+        setIsSyncing(false);
+      }
+    }
+  };
 
   const addToast = (title: string, message: string, type: 'success' | 'info' | 'warning' | 'error' = 'success') => {
     const id = generateUUID();
@@ -102,17 +211,209 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
 
   const getDocumentById = (id: string): DocumentRecord | undefined => {
     if (!id) return undefined;
-    const cleanId = id.trim().toUpperCase();
-    return documents.find(d => d.id.toUpperCase() === cleanId);
+    const cleanId = normalizeDocumentId(id);
+    return documents.find(d => normalizeDocumentId(d.id) === cleanId);
+  };
+
+  /**
+   * Preflight check to verify whether a Document ID is available across local catalog,
+   * active contract, and historical contract deployments.
+   */
+  const checkDocumentIdAvailability = async (
+    id: string,
+    networkKey?: MSTNetworkKey
+  ): Promise<{ available: boolean; source?: string; reason?: string; warning?: string }> => {
+    const cleanId = normalizeDocumentId(id);
+    if (!cleanId) {
+      return { available: false, source: 'invalid_format', reason: 'Document ID cannot be empty.' };
+    }
+    const val = isValidDocumentId(cleanId);
+    if (!val.valid) {
+      return { available: false, source: 'invalid_format', reason: val.error };
+    }
+
+    // 1. Check local catalog
+    const localMatch = documents.find(d => normalizeDocumentId(d.id) === cleanId);
+    if (localMatch) {
+      return {
+        available: false,
+        source: 'local_catalog',
+        reason: 'Document ID exists in the local catalog.',
+      };
+    }
+
+    // 2. Check on-chain (active v2 contract + historical v1 contract e.g. NV-2026-566456)
+    const targetNet = networkKey || 'testnet';
+    try {
+      const onChain = await checkDocumentIdExists(cleanId, targetNet);
+      if (onChain.exists) {
+        const conflictMsg = onChain.source === 'historical_contract'
+          ? 'Document ID exists in the historical registry.'
+          : 'Document ID already exists on the active registry.';
+        return {
+          available: false,
+          source: onChain.source || 'active_contract',
+          reason: conflictMsg,
+        };
+      }
+      // If the on-chain check encountered an RPC error but didn't confirm existence,
+      // treat the ID as available with a warning — the on-chain transaction itself
+      // will enforce uniqueness atomically. Never treat an RPC error as proof of collision.
+      if (onChain.error) {
+        return {
+          available: true,
+          source: 'rpc_error',
+          warning: 'Could not verify Document ID because the RPC request failed. Please retry.',
+        };
+      }
+    } catch {
+      // Network-level failure — treat ID as provisionally available
+      return {
+        available: true,
+        source: 'rpc_error',
+        warning: 'Could not verify Document ID because the RPC request failed. Please retry.',
+      };
+    }
+
+    return { available: true };
+  };
+
+  /**
+   * Generates a collision-resistant unique Document ID verified against local state and on-chain records.
+   */
+  const generateAvailableDocumentId = async (networkKey?: MSTNetworkKey): Promise<string> => {
+    const targetNet = networkKey || 'testnet';
+    return await generateUniqueDocumentId(async (cand) => {
+      const norm = normalizeDocumentId(cand);
+      // Local catalog check — authoritative
+      if (documents.some(d => normalizeDocumentId(d.id) === norm)) return true;
+      // On-chain check
+      try {
+        const res = await checkDocumentIdExists(norm, targetNet);
+        if (res.exists) return true;
+        return false;
+      } catch {
+        return false;
+      }
+    });
   };
 
   const registerDocument = async (params: RegisterParams): Promise<DocumentRecord> => {
-    // Real browser SHA-256 calculation
-    const sha256Hash = await computeFileSHA256(params.file);
-    const newId = generateDocumentId();
-    const nowIso = new Date().toISOString();
     const targetNet: MSTNetworkKey = params.networkKey || 'testnet';
     const targetNetName = MST_NETWORKS[targetNet]?.name || 'MST Chain';
+
+    // 1. Strict PDF Validation (validates non-empty, <= 50 MB limit, and %PDF- magic bytes)
+    const pdfValidation = await validatePdfFile(params.file, params.file.name);
+    if (!pdfValidation.valid) {
+      throw new Error(pdfValidation.error || 'Invalid PDF document.');
+    }
+
+    // 2. Real browser SHA-256 calculation on exact original PDF bytes
+    const sha256Hash = await computeFileSHA256(params.file);
+
+    // 3. Duplicate Hash Policy: Reject identical document file hash locally
+    const localDuplicate = documents.find(d => areSha256HashesEqual(d.sha256Hash, sha256Hash));
+    if (localDuplicate) {
+      throw new Error(`Duplicate Hash: An identical document file is already registered under ID "${localDuplicate.id}". Duplicate document hashes are rejected to prevent replay and forgery.`);
+    }
+
+    // Check on-chain duplicate hash (active and historical contracts)
+    const onChainDuplicateId = await getOnChainIdByHash(sha256Hash, targetNet);
+    if (onChainDuplicateId) {
+      throw new Error(`Duplicate Hash: This document's SHA-256 digest is already registered on-chain under Document ID "${onChainDuplicateId}". Duplicate document hashes are rejected to prevent replay and forgery.`);
+    }
+
+    // 3. Document ID Determination & Canonical Normalization
+    let candidateId = params.customId ? normalizeDocumentId(params.customId) : '';
+    if (candidateId) {
+      const validCheck = isValidDocumentId(candidateId);
+      if (!validCheck.valid) {
+        throw new Error(validCheck.error || 'Invalid Document ID format.');
+      }
+    } else {
+      candidateId = await generateAvailableDocumentId(targetNet);
+    }
+
+    // 4. Global Document ID Uniqueness Enforcement
+    // Check local catalog
+    const localIdDuplicate = documents.find(d => normalizeDocumentId(d.id) === candidateId);
+    if (localIdDuplicate) {
+      throw new Error('Document ID exists in the local catalog.');
+    }
+
+    // Preflight check across active v2 and historical v1 contract
+    const onChainIdCheck = await checkDocumentIdExists(candidateId, targetNet);
+    if (onChainIdCheck.exists) {
+      const conflictMsg = onChainIdCheck.source === 'historical_contract'
+        ? 'Document ID exists in the historical registry.'
+        : 'Document ID already exists on the active registry.';
+      throw new Error(conflictMsg);
+    }
+    // If preflight had an RPC error, log but proceed — the on-chain transaction enforces uniqueness atomically
+    if (onChainIdCheck.error) {
+      console.warn(`[registerDocument] Preflight ID check for "${candidateId}" encountered RPC error: ${onChainIdCheck.error}. Proceeding to on-chain registration for atomic enforcement.`);
+    }
+
+    const cleanPropId = params.propertyId ? params.propertyId.trim().toUpperCase() : undefined;
+    let hasConflictWarning = false;
+    let conflictNotes: string | undefined = undefined;
+
+    if (cleanPropId) {
+      const existingPropDocs = documents.filter(d => d.propertyId && d.propertyId.toUpperCase() === cleanPropId);
+      if (existingPropDocs.length > 0) {
+        // Detect potentially conflicting ownership claims
+        const differingOwners = existingPropDocs.filter(
+          d => d.owner.trim().toLowerCase() !== params.owner.trim().toLowerCase()
+        );
+        if (differingOwners.length > 0) {
+          hasConflictWarning = true;
+          conflictNotes = `Property ID ${cleanPropId} has prior registration with differing party ("${differingOwners[0].owner}"). Flagged for authorized registrar review.`;
+        }
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // 5. Reliable PDF Persistence to Private Backend Storage (Pre-Blockchain Verification)
+    // Upload original PDF to private backend storage
+    const uploadRes = await uploadPdfToServer(candidateId, params.file, {
+      fileName: params.file.name,
+      sha256Hash,
+      fileSizeBytes: params.file.size,
+      pageCount: pdfValidation.pageCount,
+      ownerWallet: params.owner,
+      ownerEmail: params.ownerEmail,
+      ownerMobile: params.ownerMobile,
+      notificationConsent: params.notificationConsent,
+    });
+
+    if (!uploadRes.success) {
+      if (uploadRes.isConflict) {
+        throw new Error(uploadRes.error || `Conflict: Document ID "${candidateId}" is already registered with a different file.`);
+      }
+      throw new Error(
+        `Storage Persistence Failed: Could not securely save original PDF in backend storage (${uploadRes.error || 'Server rejected file upload'}). Blockchain transaction was aborted to ensure original document availability.`
+      );
+    }
+
+    // Verify server actually wrote the file to disk and verified matching SHA-256 hash
+    const storageVerify = await verifyServerStorage(candidateId, sha256Hash);
+    if (!storageVerify.verified) {
+      throw new Error(
+        `Storage Persistence Failed: Could not securely save and verify the original PDF in backend storage (${storageVerify.error || 'Disk verification failed'}). Blockchain transaction was aborted to ensure original document availability.`
+      );
+    }
+
+    // Also persist to local client cache (IndexedDB / memory)
+    await saveLocalPDF(candidateId, params.file, {
+      fileName: params.file.name,
+      sha256Hash,
+      fileSizeBytes: params.file.size,
+      pageCount: pdfValidation.pageCount,
+      ownerEmail: params.ownerEmail,
+      ownerMobile: params.ownerMobile,
+      notificationConsent: params.notificationConsent,
+    });
 
     let txHash: string | undefined = undefined;
     let blockNumber: number | undefined = undefined;
@@ -121,10 +422,10 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
     let registrantAddress: string | undefined = undefined;
     let onChainStatus: 'unregistered' | 'registered' | 'revoked' = 'unregistered';
 
-    // On-Chain MST Chain registration when wallet provider is provided
+    // 6. On-Chain MST Chain registration only after verified storage
     if (params.rawProvider) {
       if (isContractConfigured(targetNet)) {
-        const onChainResult = await registerOnChain(newId, sha256Hash, params.type, params.rawProvider, targetNet);
+        const onChainResult = await registerOnChain(candidateId, sha256Hash, params.type, params.rawProvider, targetNet);
         if (onChainResult.success) {
           txHash = onChainResult.txHash;
           blockNumber = onChainResult.blockNumber;
@@ -132,25 +433,45 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
           networkChainId = onChainResult.networkChainId;
           registrantAddress = onChainResult.registrant;
           onChainStatus = 'registered';
+
+          // Persist transaction hash, block number, network, contract address in server database
+          if (txHash) {
+            await confirmServerRegistration(candidateId, {
+              txHash,
+              blockNumber,
+              networkName: targetNetName,
+              chainId: networkChainId,
+              contractAddress,
+              title: params.name,
+              category: params.type,
+              issuer: params.owner,
+              status: 'confirmed',
+            });
+          }
+
           addToast(`Registered On ${targetNetName}`, `Confirmed in block #${blockNumber}. Tx: ${txHash?.slice(0, 10)}...`);
         } else {
-          addToast('Blockchain Anchoring Warning', onChainResult.error || 'Failed to record on-chain. Saved locally.', 'warning');
+          // Revert cleanly without saving local record or incrementing count
+          throw new Error(onChainResult.error || 'Failed to record on-chain.');
         }
       } else {
         addToast(
           'Smart Contract Unconfigured',
-          `Contract not yet deployed to ${targetNetName}. Saved to local catalog.`,
+          `Contract not yet deployed to ${targetNetName}. Saved to verified storage catalog.`,
           'info'
         );
       }
     }
 
     const newDoc: DocumentRecord = {
-      id: newId,
+      id: candidateId,
       name: params.name,
       type: params.type,
       description: params.description,
       owner: params.owner,
+      propertyId: cleanPropId,
+      hasConflictWarning,
+      conflictNotes,
       issueDate: params.issueDate,
       expiryDate: params.expiryDate,
       registeredAt: nowIso,
@@ -158,7 +479,8 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       sha256Hash,
       fileName: params.file.name,
       fileSizeBytes: params.file.size,
-      qrPayloadUrl: `/verify/${newId}`,
+      pageCount: pdfValidation.pageCount,
+      qrPayloadUrl: `/verify/${candidateId}`,
       txHash,
       blockNumber,
       contractAddress,
@@ -168,28 +490,32 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       onChainStatus,
     };
 
-    const updatedDocs = [newDoc, ...documents];
-    setDocuments(updatedDocs);
-    saveDocuments(updatedDocs);
+    setDocuments(prev => {
+      const merged = mergeDocuments(prev, [newDoc]);
+      saveDocuments(merged);
+      return merged;
+    });
 
     const newActivity: ActivityEvent = {
-      id: generateUUID(),
+      id: txHash ? `act_${txHash}_reg` : generateUUID(),
       type: 'Document Registered',
       title: onChainStatus === 'registered' ? 'Document Anchored On-Chain' : 'New Document Registered',
       description: onChainStatus === 'registered' 
         ? `Registered "${newDoc.name}" (${newDoc.id}) on ${targetNetName}. Tx: ${txHash?.slice(0, 12)}...`
-        : `Registered "${newDoc.name}" with ID ${newDoc.id}. SHA-256 fingerprint computed locally.`,
+        : `Registered "${newDoc.name}" with ID ${newDoc.id}. SHA-256 fingerprint verified in storage.`,
       documentId: newDoc.id,
       timestamp: nowIso,
       status: 'success',
     };
 
-    const updatedActivities = [newActivity, ...activities];
-    setActivities(updatedActivities);
-    saveActivities(updatedActivities);
+    setActivities(prev => {
+      const merged = mergeActivities(prev, [newActivity]);
+      saveActivities(merged);
+      return merged;
+    });
 
     if (onChainStatus !== 'registered') {
-      addToast('Document Registered', `Assigned ID ${newId}. Document is ready for verification.`);
+      addToast('Document Registered', `Assigned ID ${candidateId}. Document is ready for verification.`);
     }
     return newDoc;
   };
@@ -266,7 +592,7 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
           return result;
         }
 
-        if (found.sha256Hash.toLowerCase() === computedHash.toLowerCase()) {
+        if (areSha256HashesEqual(found.sha256Hash, computedHash)) {
           const isRevoked = found.onChainStatus === 'revoked';
           const result: VerificationCheckResult = {
             state: isRevoked ? 'mismatch' : found.status === 'Pending' ? 'pending' : 'verified',
@@ -310,7 +636,7 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       }
 
       // Query by file hash alone
-      let matchByHash = documents.find(d => d.sha256Hash.toLowerCase() === computedHash.toLowerCase());
+      let matchByHash = documents.find(d => areSha256HashesEqual(d.sha256Hash, computedHash));
       let matchedNet: MSTNetworkKey | undefined = matchByHash?.networkKey;
 
       // If not in local catalog, query on-chain reverse lookup across configured networks
@@ -576,9 +902,11 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   const updateDocument = (id: string, updates: Partial<DocumentRecord>) => {
-    const updated = documents.map(d => d.id === id ? { ...d, ...updates } : d);
-    setDocuments(updated);
-    saveDocuments(updated);
+    setDocuments(prev => {
+      const updated = prev.map(d => d.id === id ? { ...d, ...updates } : d);
+      saveDocuments(updated);
+      return updated;
+    });
 
     const newAct: ActivityEvent = {
       id: generateUUID(),
@@ -589,9 +917,11 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       timestamp: new Date().toISOString(),
       status: 'info',
     };
-    const updatedActs = [newAct, ...activities];
-    setActivities(updatedActs);
-    saveActivities(updatedActs);
+    setActivities(prev => {
+      const merged = mergeActivities(prev, [newAct]);
+      saveActivities(merged);
+      return merged;
+    });
 
     addToast('Document Updated', `Changes to ${id} have been saved.`);
   };
@@ -667,12 +997,37 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
   };
 
+  const getDocumentsByPropertyId = (propertyId: string): DocumentRecord[] => {
+    if (!propertyId) return [];
+    const clean = propertyId.trim().toUpperCase();
+    return documents.filter(d => d.propertyId && d.propertyId.toUpperCase() === clean);
+  };
+
+  const checkPropertyConflicts = (propertyId: string, currentOwner: string) => {
+    if (!propertyId) return { hasConflict: false, existingDocs: [] };
+    const clean = propertyId.trim().toUpperCase();
+    const existingDocs = documents.filter(d => d.propertyId && d.propertyId.toUpperCase() === clean);
+    if (existingDocs.length === 0) {
+      return { hasConflict: false, existingDocs: [] };
+    }
+    const differing = existingDocs.filter(d => d.owner.trim().toLowerCase() !== currentOwner.trim().toLowerCase());
+    if (differing.length > 0) {
+      return {
+        hasConflict: true,
+        existingDocs,
+        note: `Existing documents for Property ${clean} list a different owner/party ("${differing[0].owner}"). Flagged for registrar review.`
+      };
+    }
+    return { hasConflict: false, existingDocs };
+  };
+
   const resetAllDemoData = () => {
     resetStorage();
+    clearAllLocalPDFs().catch(() => {});
     setDocuments([]);
     setSharedRecords([]);
     setActivities([]);
-    addToast('Repository Reset', 'Local repository cleared to initial state.', 'info');
+    addToast('Repository Reset', 'Local repository and cached PDFs cleared to initial state.', 'info');
   };
 
   return (
@@ -682,6 +1037,9 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
         sharedRecords,
         activities,
         toasts,
+        isSyncing,
+        syncError,
+        syncWithBlockchain,
         addToast,
         removeToast,
         registerDocument,
@@ -693,6 +1051,10 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
         updateDocument,
         resetAllDemoData,
         getDocumentById,
+        getDocumentsByPropertyId,
+        checkPropertyConflicts,
+        checkDocumentIdAvailability,
+        generateAvailableDocumentId,
       }}
     >
       {children}

@@ -1,8 +1,7 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '../ui/Button';
-import { Check } from 'lucide-react';
-import { QRCodeSVG } from 'qrcode.react';
+import { Check, ShieldCheck } from 'lucide-react';
 
 export const Hero: React.FC = () => {
   const navigate = useNavigate();
@@ -137,7 +136,7 @@ export const Hero: React.FC = () => {
         </div>
       </div>
 
-      {/* 6. Right Edge: Second tall gradient panel (blue -> pink) with small QR tile cropped off edge */}
+      {/* 6. Right Edge: Second tall gradient panel (blue -> pink) with on-chain verified tile cropped off edge */}
       <div className="hidden lg:block absolute top-36 -right-16 z-0 pointer-events-none">
         <div className="selection-box p-3 rounded-[36px]">
           <div className="selection-handle tl" />
@@ -145,8 +144,9 @@ export const Hero: React.FC = () => {
           <div className="selection-handle bl" />
           <div className="selection-handle br" />
           <div className="w-64 h-80 rounded-[32px] bg-gradient-to-br from-[#1F6FF0] to-[#FF2E88] p-6 flex flex-col justify-end shadow-lg">
-            <div className="w-20 h-20 bg-white rounded-xl p-2 shadow-md">
-              <QRCodeSVG value="https://notaryvault.io/verify" size={64} />
+            <div className="w-20 h-20 bg-white rounded-xl p-2.5 shadow-md flex flex-col items-center justify-center text-center">
+              <ShieldCheck className="w-7 h-7 text-[#1F6FF0]" />
+              <span className="text-[8px] font-bold text-stone-700 tracking-tight mt-1">VERIFIED</span>
             </div>
           </div>
         </div>

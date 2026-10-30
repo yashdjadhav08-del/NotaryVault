@@ -6,24 +6,33 @@ import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { StatusPill } from '../components/ui/StatusPill';
 import { Modal } from '../components/ui/Modal';
-import { OptionRow } from '../components/ui/OptionRow';
 import { EmptyState } from '../components/ui/EmptyState';
 import { useDocuments } from '../context/DocumentContext';
 import type { SharedRecord } from '../types';
 import { 
-  Share2, 
   PlusCircle, 
   Search, 
   Ban, 
   Copy, 
-  Check, 
   Mail, 
-  ShieldAlert 
+  ShieldAlert,
+  Send,
+  AlertTriangle,
+  CheckCircle2
 } from 'lucide-react';
 import { formatDate } from '../lib/format';
+import { useWallet } from '../context/WalletContext';
+import { 
+  shareDocumentWithDelivery, 
+  requestAuthChallenge, 
+  verifyAuthSignature, 
+  getClientSession, 
+  type DocumentShareResult 
+} from '../lib/pdfStorage';
 
 export const SharedDocumentsPage: React.FC = () => {
   const { documents, sharedRecords, shareDocument, revokeSharing, addToast } = useDocuments();
+  const { address: walletAddress, status: walletStatus, provider } = useWallet();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
@@ -31,11 +40,14 @@ export const SharedDocumentsPage: React.FC = () => {
   // Share Modal State
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [selectedDocId, setSelectedDocId] = useState(documents[0]?.id || '');
-  const [recipient, setRecipient] = useState('');
-  const [durationDays, setDurationDays] = useState(7);
-  const [durationLabel, setDurationLabel] = useState('7 Days');
+  const [recipientEmail, setRecipientEmail] = useState('');
+  const [sendPdfByEmail, setSendPdfByEmail] = useState(true);
+  const [recipientConsent, setRecipientConsent] = useState(true);
+  const [expiryPolicy, setExpiryPolicy] = useState<'1h' | '24h' | '7d' | '30d' | '90d' | 'never'>('24h');
   const [isSubmittingShare, setIsSubmittingShare] = useState(false);
   const [shareError, setShareError] = useState('');
+  const [shareDeliveryResult, setShareDeliveryResult] = useState<DocumentShareResult | null>(null);
+  const [copiedShareLink, setCopiedShareLink] = useState(false);
 
   // Revoke Confirm Modal State
   const [recordToRevoke, setRecordToRevoke] = useState<SharedRecord | null>(null);
@@ -54,27 +66,91 @@ export const SharedDocumentsPage: React.FC = () => {
 
   const handleShareSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!recipient.trim() || !recipient.includes('@')) {
-      setShareError('Please enter a valid recipient email address.');
-      return;
-    }
+    setShareError('');
+    setShareDeliveryResult(null);
+
     if (!selectedDocId) {
       setShareError('Please select a document to share.');
       return;
     }
 
-    setShareError('');
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!recipientEmail.trim() || !emailRegex.test(recipientEmail.trim())) {
+      setShareError('Please enter a valid recipient email address (e.g. counsel@notaryvault.org).');
+      return;
+    }
+
+    if (!recipientConsent && sendPdfByEmail) {
+      setShareError('Please confirm recipient consent to receive notifications.');
+      return;
+    }
+
     setIsSubmittingShare(true);
 
     try {
-      await shareDocument({
+      let session = getClientSession();
+      const activeAddr = walletAddress?.toLowerCase();
+      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
+
+      if (!isSessionValid) {
+        if (walletStatus !== 'connected' || !provider || !walletAddress) {
+          addToast('Wallet Connection Required', 'Please connect your owner wallet to authorize document sharing.', 'warning');
+          setShareError('Owner wallet connection required for authorization.');
+          setIsSubmittingShare(false);
+          return;
+        }
+
+        const challenge = await requestAuthChallenge(walletAddress);
+        const signer = await provider.getSigner();
+        const signature = await signer.signMessage(challenge.challengeText);
+
+        const verifyRes = await verifyAuthSignature({
+          address: walletAddress,
+          signature,
+          challengeId: challenge.challengeId,
+          challengeText: challenge.challengeText,
+        });
+
+        if (!verifyRes.success || !verifyRes.session) {
+          throw new Error(verifyRes.error || 'Authentication signature rejected.');
+        }
+        session = verifyRes.session;
+      }
+
+      if (!session) throw new Error('Session could not be established.');
+
+      const res = await shareDocumentWithDelivery({
         documentId: selectedDocId,
-        recipient: recipient.trim(),
-        durationDays,
-        durationLabel,
+        sessionToken: session.token,
+        recipientEmail: recipientEmail.trim(),
+        recipientMobile: undefined,
+        sendEmail: sendPdfByEmail,
+        sendSms: false,
+        expiryPolicy,
+        purpose: 'Verified Document Share',
+        recipientConsent,
       });
-      setShareModalOpen(false);
-      setRecipient('');
+
+      setShareDeliveryResult(res);
+
+      if (res.success) {
+        const durationDisplay = expiryPolicy === 'never' ? 'No Fixed Expiry' : expiryPolicy;
+        await shareDocument({
+          documentId: selectedDocId,
+          recipient: recipientEmail.trim() || 'Confidential Recipient',
+          durationDays: expiryPolicy === '1h' ? 0.04 : (expiryPolicy === '24h' ? 1 : (expiryPolicy === '7d' ? 7 : (expiryPolicy === '30d' ? 30 : (expiryPolicy === '90d' ? 90 : 365)))),
+          durationLabel: durationDisplay,
+        });
+
+        addToast('Document Shared', 'Document share dispatched with server-side authorization.');
+      } else {
+        setShareError(res.error || 'Failed to dispatch document share.');
+        addToast('Share Failed', res.error || 'Delivery failed.', 'error');
+      }
+    } catch (err: any) {
+      setShareError(err?.message || 'Authorization failed.');
+      addToast('Share Error', err?.message || 'Failed to dispatch document share.', 'error');
     } finally {
       setIsSubmittingShare(false);
     }
@@ -230,7 +306,7 @@ export const SharedDocumentsPage: React.FC = () => {
                             className="p-1.5 text-stone-500 hover:text-[#1F6FF0] rounded-lg hover:bg-stone-100 cursor-pointer"
                             title="Copy share URL"
                           >
-                            {copiedId === item.id ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
+                            {copiedId === item.id ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
                           </button>
 
                           {item.status === 'Active' && (
@@ -262,18 +338,21 @@ export const SharedDocumentsPage: React.FC = () => {
           ========================================================================= */}
       <Modal
         isOpen={shareModalOpen}
-        onClose={() => setShareModalOpen(false)}
-        title="Share Document Reference"
-        subtitle="Generate a time-delimited inspection link for external reviewers or counsel."
+        onClose={() => { setShareModalOpen(false); setShareDeliveryResult(null); }}
+        title="Share Document"
+        subtitle="Deliver original PDF via email with verified cryptographic access links."
       >
-        <form onSubmit={handleShareSubmit} className="space-y-5">
+        <form onSubmit={handleShareSubmit} className="space-y-4">
           <div>
             <label className="block text-xs font-semibold text-stone-700 uppercase tracking-wider mb-1.5">
               Select Document to Share *
             </label>
             <select
               value={selectedDocId}
-              onChange={(e) => setSelectedDocId(e.target.value)}
+              onChange={(e) => {
+                setSelectedDocId(e.target.value);
+                setShareDeliveryResult(null);
+              }}
               className="w-full bg-white text-[#1C1C1C] text-sm rounded-xl border border-black/15 py-2.5 px-3 focus:outline-none focus:ring-2 focus:ring-[#1F6FF0]/20 focus:border-[#1F6FF0]"
             >
               {documents.map(d => (
@@ -284,58 +363,214 @@ export const SharedDocumentsPage: React.FC = () => {
             </select>
           </div>
 
-          <Input
-            label="Recipient Email Address *"
-            placeholder="e.g. auditor@bank.org"
-            value={recipient}
-            onChange={(e) => setRecipient(e.target.value)}
-            error={shareError}
-          />
+          {/* Delivery Channels */}
+          <div className="space-y-3">
+            {/* Active Email Channel */}
+            <div className="p-3.5 bg-blue-50/50 rounded-xl border border-[#1F6FF0]/30 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Mail className="w-4 h-4 text-[#1F6FF0]" />
+                  <span className="text-xs font-bold text-stone-900">Email Delivery (PDF Attachment)</span>
+                </div>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                  Active
+                </span>
+              </div>
+              <label className="flex items-start gap-2.5 cursor-pointer text-xs text-stone-800">
+                <input
+                  type="checkbox"
+                  checked={sendPdfByEmail}
+                  onChange={(e) => setSendPdfByEmail(e.target.checked)}
+                  className="mt-0.5 rounded border-stone-300 text-[#1F6FF0] focus:ring-[#1F6FF0]"
+                />
+                <div>
+                  <span className="font-semibold block text-stone-900">Send PDF as Email Attachment</span>
+                  <span className="text-[11px] text-stone-600">
+                    The server retrieves original PDF from private storage, recomputes SHA-256 against on-chain hash, and attaches it directly to the email.
+                  </span>
+                </div>
+              </label>
+            </div>
 
-          <div>
-            <label className="block text-xs font-semibold text-stone-700 uppercase tracking-wider mb-2">
-              Access Duration
-            </label>
-            <div className="space-y-2">
-              <OptionRow
-                label="24 Hours (Immediate Inspection)"
-                selected={durationDays === 1}
-                onClick={() => { setDurationDays(1); setDurationLabel('24 Hours'); }}
+            {/* Recipient Email */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-semibold text-stone-700 uppercase tracking-wider">
+                  Recipient Email Address *
+                </label>
+              </div>
+              <Input
+                placeholder="e.g. counsel@notaryvault.org"
+                value={recipientEmail}
+                onChange={(e) => setRecipientEmail(e.target.value)}
+                disabled={isSubmittingShare}
               />
-              <OptionRow
-                label="7 Days (Standard Audit)"
-                selected={durationDays === 7}
-                onClick={() => { setDurationDays(7); setDurationLabel('7 Days'); }}
-              />
-              <OptionRow
-                label="30 Days (Extended Due Diligence)"
-                selected={durationDays === 30}
-                onClick={() => { setDurationDays(30); setDurationLabel('30 Days'); }}
-              />
+            </div>
+
+            {/* Mobile Sharing — Coming Soon */}
+            <div 
+              id="shared-mobile-sharing-coming-soon-card"
+              className="p-3.5 bg-stone-100/70 rounded-xl border border-dashed border-stone-300 space-y-2 opacity-85 select-none"
+              aria-disabled="true"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-base select-none" aria-hidden="true">📱</span>
+                  <span className="text-xs font-bold text-stone-700">Mobile Sharing</span>
+                </div>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-stone-200 text-stone-600 border border-stone-300">
+                  Coming Soon
+                </span>
+              </div>
+              <p className="text-[11px] text-stone-500 leading-relaxed">
+                Share documents securely via mobile number and SMS. This feature will be available in a future update.
+              </p>
+              <div className="space-y-1 pt-1">
+                <input
+                  id="shared-recipient-mobile-input-disabled"
+                  type="text"
+                  disabled
+                  readOnly
+                  placeholder="Recipient Mobile Number (Disabled — Coming Soon)"
+                  className="w-full text-xs bg-stone-200/50 text-stone-400 border border-stone-300 rounded-lg py-2 px-3 cursor-not-allowed select-none opacity-70"
+                />
+              </div>
             </div>
           </div>
 
-          <div className="p-3 bg-stone-100 rounded-xl text-xs text-stone-600 leading-relaxed">
-            <strong>Access Notice:</strong> Generating a share reference records an audit entry and creates a verifiable access link for this document.
+          {/* Expiry Policy Selector */}
+          <div>
+            <label className="block text-xs font-semibold text-stone-700 uppercase tracking-wider mb-2">
+              Access Expiry Policy
+            </label>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { id: '1h', label: '1 Hour' },
+                { id: '24h', label: '24 Hours' },
+                { id: '7d', label: '7 Days' },
+                { id: '30d', label: '30 Days' },
+                { id: '90d', label: '90 Days' },
+                { id: 'never', label: 'No Fixed Expiry' },
+              ].map(opt => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setExpiryPolicy(opt.id as any)}
+                  className={`py-2 px-2.5 rounded-lg text-xs font-semibold border transition-all text-center ${
+                    expiryPolicy === opt.id
+                      ? 'border-[#1F6FF0] bg-blue-50 text-[#1F6FF0]'
+                      : 'border-black/10 bg-white text-stone-700 hover:border-black/20'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            {expiryPolicy === 'never' && (
+              <p className="text-[11px] text-stone-500 mt-1.5 leading-tight">
+                * No-expiry links remain subject to server-side cryptographic authorization and can be revoked by the owner at any time.
+              </p>
+            )}
           </div>
+
+          {/* Recipient Consent Checkbox */}
+          <label className="flex items-center gap-2 cursor-pointer text-xs text-stone-700 pt-1">
+            <input
+              type="checkbox"
+              checked={recipientConsent}
+              onChange={(e) => setRecipientConsent(e.target.checked)}
+              className="rounded border-stone-300 text-[#1F6FF0] focus:ring-[#1F6FF0]"
+            />
+            <span>I confirm recipient consent to receive this document notification.</span>
+          </label>
+
+          {shareError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+              <span>{shareError}</span>
+            </div>
+          )}
+
+          {/* Delivery Status Card after Send */}
+          {shareDeliveryResult && (
+            <div className="p-4 bg-stone-50 rounded-xl border border-black/10 space-y-3">
+              <div className="flex items-center gap-2 text-xs font-bold text-stone-900">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                <span>Share Reference Generated</span>
+              </div>
+
+              {/* Email Status */}
+              {sendPdfByEmail && (
+                <div className="flex items-center justify-between text-xs p-2.5 bg-white rounded-lg border border-black/5">
+                  <span className="font-semibold text-stone-700 flex items-center gap-1.5">
+                    <Mail className="w-3.5 h-3.5 text-stone-500" />
+                    <span>Email Delivery:</span>
+                  </span>
+                  <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                    shareDeliveryResult.emailDelivery?.status === 'accepted'
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
+                      ? 'bg-amber-100 text-amber-800'
+                      : 'bg-rose-100 text-rose-800'
+                  }`}>
+                    {shareDeliveryResult.emailDelivery?.status === 'accepted'
+                      ? 'Accepted by Provider'
+                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
+                      ? 'Provider Not Configured'
+                      : 'Delivery Failed'}
+                  </span>
+                </div>
+              )}
+
+
+              {/* Secure Link */}
+              {shareDeliveryResult.secureAccessUrl && (
+                <div className="space-y-1">
+                  <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
+                    Secure Access URL
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <input
+                      readOnly
+                      value={shareDeliveryResult.secureAccessUrl}
+                      className="flex-1 text-xs font-mono bg-white p-2 rounded border border-black/10 select-all"
+                    />
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      icon={copiedShareLink ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      onClick={() => {
+                        navigator.clipboard.writeText(shareDeliveryResult.secureAccessUrl || '');
+                        setCopiedShareLink(true);
+                        setTimeout(() => setCopiedShareLink(false), 2000);
+                      }}
+                    >
+                      {copiedShareLink ? 'Copied' : 'Copy'}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/[0.06]">
             <Button
               type="button"
               variant="secondary"
               size="sm"
-              onClick={() => setShareModalOpen(false)}
+              onClick={() => { setShareModalOpen(false); setShareDeliveryResult(null); }}
             >
-              Cancel
+              Close
             </Button>
             <Button
               type="submit"
               variant="primary-app"
               size="sm"
               loading={isSubmittingShare}
-              icon={<Share2 className="w-4 h-4" />}
+              icon={<Send className="w-4 h-4" />}
             >
-              Create Share Reference
+              Send Document
             </Button>
           </div>
         </form>

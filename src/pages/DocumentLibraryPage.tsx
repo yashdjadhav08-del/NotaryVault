@@ -7,18 +7,22 @@ import { Input } from '../components/ui/Input';
 import { StatusPill } from '../components/ui/StatusPill';
 import { EmptyState } from '../components/ui/EmptyState';
 import { useDocuments } from '../context/DocumentContext';
+import { useWallet } from '../context/WalletContext';
 import type { DocumentType } from '../types';
 import { 
   Search, 
   PlusCircle, 
   FileText, 
-  ChevronRight
+  ChevronRight,
+  RefreshCw,
+  AlertCircle
 } from 'lucide-react';
 import { formatDate } from '../lib/format';
 
 export const DocumentLibraryPage: React.FC = () => {
   const navigate = useNavigate();
-  const { documents } = useDocuments();
+  const { documents, isSyncing, syncError, syncWithBlockchain } = useDocuments();
+  const { selectedNetwork, activeNetworkConfig } = useWallet();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedType, setSelectedType] = useState<string>('all');
@@ -66,17 +70,46 @@ export const DocumentLibraryPage: React.FC = () => {
       title="Document Library"
       subtitle="Search, filter, and inspect registered legal deeds and cryptographic verification records."
       actions={
-        <Button
-          variant="primary-app"
-          size="sm"
-          icon={<PlusCircle className="w-4 h-4" />}
-          onClick={() => navigate('/app/register')}
-        >
-          Register Document
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin text-blue-600' : 'text-stone-500'}`} />}
+            onClick={() => syncWithBlockchain(selectedNetwork, true)}
+            title="Sync and restore records from MST Chain"
+          >
+            {isSyncing ? 'Syncing...' : 'Sync On-Chain'}
+          </Button>
+          <Button
+            variant="primary-app"
+            size="sm"
+            icon={<PlusCircle className="w-4 h-4" />}
+            onClick={() => navigate('/app/register')}
+          >
+            Register Document
+          </Button>
+        </div>
       }
     >
       <div className="space-y-6">
+
+        {/* Sync Warning Banner if applicable */}
+        {syncError && (
+          <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-between text-xs text-amber-900 gap-3">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>
+                On-chain sync warning for {activeNetworkConfig.name}: {syncError}. Local records are preserved.
+              </span>
+            </div>
+            <button
+              onClick={() => syncWithBlockchain(selectedNetwork, true)}
+              className="text-xs font-semibold text-amber-800 underline hover:text-amber-950 shrink-0 cursor-pointer"
+            >
+              Retry Sync
+            </button>
+          </div>
+        )}
         
         {/* Filter and Search Bar */}
         <Card className="p-4 bg-white">

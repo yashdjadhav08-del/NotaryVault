@@ -70,7 +70,7 @@ export const LandingNav: React.FC = () => {
                     </div>
                     <div>
                       <div className="text-sm font-semibold text-[#1C1C1C]">Instant Document Verification</div>
-                      <div className="text-xs text-stone-500 mt-0.5">Cryptographic SHA-256 match and QR audits.</div>
+                      <div className="text-xs text-stone-500 mt-0.5">Cryptographic SHA-256 match and on-chain audits.</div>
                     </div>
                   </Link>
                 </div>

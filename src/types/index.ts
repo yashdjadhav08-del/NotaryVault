@@ -30,7 +30,13 @@ export interface DocumentRecord {
   sha256Hash: string;
   fileName: string;
   fileSizeBytes: number;
+  pageCount?: number;
   qrPayloadUrl: string;
+
+  // Property identification and grouping
+  propertyId?: string; // e.g. PROP-2026-0891
+  hasConflictWarning?: boolean;
+  conflictNotes?: string;
 
   // On-chain verification & MST Chain integration attributes
   txHash?: string;
@@ -40,6 +46,8 @@ export interface DocumentRecord {
   networkKey?: 'testnet' | 'mainnet';
   onChainStatus?: 'unregistered' | 'registered' | 'revoked';
   registrantAddress?: string;
+  ownerEmail?: string;
+  ownerMobile?: string;
 }
 
 export type AccessStatus = 'Active' | 'Expired' | 'Revoked';
@@ -55,13 +63,52 @@ export interface SharedRecord {
   accessCount: number;
 }
 
+export type AuthorRole = 'super_author' | 'secondary_author' | 'public_user';
+
+export type ApplicationStatus = 'Pending' | 'Approved' | 'Rejected';
+
+export interface AuthorApplication {
+  id: string; // e.g. APP-2026-000101
+  applicantWallet: string;
+  applicantName: string;
+  organization: string;
+  licenseNumber: string;
+  contactEmail: string;
+  justification: string;
+  submittedAt: string;
+  status: ApplicationStatus;
+  reviewedAt?: string;
+  reviewedBy?: string;
+  reviewNotes?: string;
+  approvalTxHash?: string;
+  submissionTxHash?: string;
+  networkKey?: 'testnet' | 'mainnet';
+}
+
+export interface AuthorizedAuthorRecord {
+  walletAddress: string;
+  name: string;
+  organization: string;
+  licenseNumber: string;
+  role: 'secondary_author';
+  authorizedAt: string;
+  authorizedBy: string;
+  txHash?: string;
+  isActive: boolean;
+  networkKey?: 'testnet' | 'mainnet';
+}
+
 export type ActivityEventType = 
   | 'Document Registered'
   | 'Verification Requested'
   | 'Verification Completed'
   | 'Document Shared'
   | 'Access Revoked'
-  | 'Document Details Updated';
+  | 'Document Details Updated'
+  | 'Author Application Submitted'
+  | 'Author Application Approved'
+  | 'Author Application Rejected'
+  | 'Author Permissions Revoked';
 
 export interface ActivityEvent {
   id: string;
@@ -88,5 +135,7 @@ export interface VerificationCheckResult {
   onChainTimestamp?: number;
   isRevokedOnChain?: boolean;
   networkKey?: 'testnet' | 'mainnet';
+  contractAddress?: string;
+  isHistorical?: boolean;
   txHash?: string;
 }

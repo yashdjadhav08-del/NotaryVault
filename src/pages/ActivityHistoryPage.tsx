@@ -14,12 +14,16 @@ import {
   Share2, 
   Ban, 
   Edit3, 
-  ExternalLink
+  ExternalLink,
+  RefreshCw
 } from 'lucide-react';
+import { Button } from '../components/ui/Button';
 import { formatDateTime, formatRelativeTime } from '../lib/format';
+import { useWallet } from '../context/WalletContext';
 
 export const ActivityHistoryPage: React.FC = () => {
-  const { activities } = useDocuments();
+  const { activities, isSyncing, syncWithBlockchain } = useDocuments();
+  const { selectedNetwork } = useWallet();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedEventType, setSelectedEventType] = useState<string>('all');
@@ -57,6 +61,17 @@ export const ActivityHistoryPage: React.FC = () => {
     <AppShell
       title="Activity History"
       subtitle="Complete chronological audit trail of document registrations, SHA-256 verifications, and sharing events."
+      actions={
+        <Button
+          variant="secondary"
+          size="sm"
+          icon={<RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin text-blue-600' : 'text-stone-500'}`} />}
+          onClick={() => syncWithBlockchain(selectedNetwork, true)}
+          title="Sync audit trail from MST Chain events"
+        >
+          {isSyncing ? 'Syncing...' : 'Sync History'}
+        </Button>
+      }
     >
       <div className="space-y-6">
         

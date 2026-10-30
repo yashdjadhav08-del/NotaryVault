@@ -3,9 +3,13 @@ import type { ReactNode } from 'react';
 import {
   MST_NETWORKS,
   isChainIdMatchingNetwork,
+  getContractAdmin,
+  checkIsOnChainAuthor,
   type MSTNetworkKey,
   type MSTNetworkDefinition
 } from '../services/contractService';
+import type { AuthorRole } from '../types';
+import { loadAuthorizedAuthors } from '../lib/storage';
 
 export type WalletConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type { MSTNetworkKey, MSTNetworkDefinition };
@@ -25,6 +29,15 @@ export interface WalletContextType {
   isProviderAvailable: boolean;
   provider: any;
   error: string | null;
+  contractAdminAddress: string | null;
+  isAdminWallet: boolean;
+  isRegistrar: boolean;
+  role: AuthorRole;
+  isSuperAuthor: boolean;
+  isSecondaryAuthor: boolean;
+  isAuthor: boolean;
+  isPublicUser: boolean;
+  refreshAuthorRoles: () => void;
   connectWallet: () => Promise<void>;
   cancelConnection: () => void;
   disconnectWallet: () => void;
@@ -133,6 +146,7 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   const [error, setError] = useState<string | null>(null);
   const [isBridgeKeyDetected, setIsBridgeKeyDetected] = useState(false);
   const [eip6963Provider, setEip6963Provider] = useState<any>(null);
+  const [contractAdminAddress, setContractAdminAddress] = useState<string | null>(null);
 
   // Network selection state: default to 'testnet' unless explicitly saved
   const [selectedNetwork, setSelectedNetworkState] = useState<MSTNetworkKey>(() => {
@@ -271,6 +285,71 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   const isMSTNetwork = Boolean(detectedNetworkKey !== null);
   const isCorrectNetwork = Boolean(detectedNetworkKey === selectedNetwork);
   const activeNetworkConfig = MST_NETWORKS[selectedNetwork];
+
+  // Fetch authorized admin address from smart contract
+  useEffect(() => {
+    let isMounted = true;
+    getContractAdmin(selectedNetwork)
+      .then(adminAddr => {
+        if (isMounted && adminAddr) {
+          setContractAdminAddress(adminAddr);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedNetwork]);
+
+  const isSuperAuthor = useMemo(() => {
+    if (!address || !contractAdminAddress) return false;
+    return address.trim().toLowerCase() === contractAdminAddress.trim().toLowerCase();
+  }, [address, contractAdminAddress]);
+
+  // Track active secondary authors from storage and chain
+  const [activeSecondaryAuthors, setActiveSecondaryAuthors] = useState<string[]>(() => {
+    return loadAuthorizedAuthors().filter(a => a.isActive).map(a => a.walletAddress.toLowerCase());
+  });
+
+  const [isChainSecondaryAuthor, setIsChainSecondaryAuthor] = useState<boolean>(false);
+
+  const refreshAuthorRoles = () => {
+    setActiveSecondaryAuthors(
+      loadAuthorizedAuthors().filter(a => a.isActive).map(a => a.walletAddress.toLowerCase())
+    );
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+    if (address && !isSuperAuthor) {
+      checkIsOnChainAuthor(address, selectedNetwork)
+        .then(res => {
+          if (isMounted) setIsChainSecondaryAuthor(res);
+        })
+        .catch(() => {});
+    } else {
+      setIsChainSecondaryAuthor(false);
+    }
+    return () => { isMounted = false; };
+  }, [address, isSuperAuthor, selectedNetwork]);
+
+  const isSecondaryAuthor = useMemo(() => {
+    if (!address || isSuperAuthor) return false;
+    const clean = address.trim().toLowerCase();
+    return isChainSecondaryAuthor || activeSecondaryAuthors.includes(clean);
+  }, [address, isSuperAuthor, isChainSecondaryAuthor, activeSecondaryAuthors]);
+
+  const isAuthor = isSuperAuthor || isSecondaryAuthor;
+  const isPublicUser = !isAuthor;
+
+  const role: AuthorRole = isSuperAuthor
+    ? 'super_author'
+    : isSecondaryAuthor
+    ? 'secondary_author'
+    : 'public_user';
+
+  const isAdminWallet = isSuperAuthor;
+  const isRegistrar = isAuthor;
 
   /**
    * Cancel connection request and reset status from 'connecting' back to 'disconnected'
@@ -444,6 +523,15 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         isBridgeKeyDetected: isBridgeKeyDetected || currentIsBk,
         isProviderAvailable: Boolean(activeProvider),
         provider: activeProvider,
+        contractAdminAddress,
+        isAdminWallet,
+        isRegistrar,
+        role,
+        isSuperAuthor,
+        isSecondaryAuthor,
+        isAuthor,
+        isPublicUser,
+        refreshAuthorRoles,
         error,
         connectWallet,
         cancelConnection,
