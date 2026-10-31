@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useLocation, Navigate } from 'react-router-dom';
 import { WalletProvider } from './context/WalletContext';
 import { DocumentProvider } from './context/DocumentContext';
 import { AuthorProvider } from './context/AuthorContext';
@@ -21,6 +21,8 @@ import { AuthorApplicationsPage } from './pages/AuthorApplicationsPage';
 import { AuthorManagementPage } from './pages/AuthorManagementPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
+import { useWallet } from './context/WalletContext';
+
 // Scroll to top on route change
 function ScrollToTop() {
   const { pathname } = useLocation();
@@ -30,6 +32,24 @@ function ScrollToTop() {
   }, [pathname]);
 
   return null;
+}
+
+// Route Guard: Requires Author status (Secondary Author or Super Author)
+function RequireAuthorRoute({ children }: { children: React.ReactNode }) {
+  const { isAuthor, status } = useWallet();
+  if (status !== 'connecting' && !isAuthor) {
+    return <Navigate to="/app" replace />;
+  }
+  return <>{children}</>;
+}
+
+// Route Guard: Requires Super Author status
+function RequireSuperAuthorRoute({ children }: { children: React.ReactNode }) {
+  const { isSuperAuthor, status } = useWallet();
+  if (status !== 'connecting' && !isSuperAuthor) {
+    return <Navigate to="/app" replace />;
+  }
+  return <>{children}</>;
 }
 
 export function App() {
@@ -51,16 +71,44 @@ export function App() {
               <Route path="/app" element={<DashboardPage />} />
               <Route path="/app/documents" element={<DocumentLibraryPage />} />
               <Route path="/app/documents/:id" element={<DocumentDetailsPage />} />
-              <Route path="/app/register" element={<RegisterDocumentPage />} />
+              <Route 
+                path="/app/register" 
+                element={
+                  <RequireAuthorRoute>
+                    <RegisterDocumentPage />
+                  </RequireAuthorRoute>
+                } 
+              />
               <Route path="/app/verify" element={<VerifyDocumentPage />} />
-              <Route path="/app/shared" element={<SharedDocumentsPage />} />
+              <Route 
+                path="/app/shared" 
+                element={
+                  <RequireAuthorRoute>
+                    <SharedDocumentsPage />
+                  </RequireAuthorRoute>
+                } 
+              />
               <Route path="/app/activity" element={<ActivityHistoryPage />} />
               <Route path="/app/settings" element={<SettingsPage />} />
 
               {/* Author Role & Management Pages */}
               <Route path="/app/apply-author" element={<ApplyAuthorPage />} />
-              <Route path="/app/author-applications" element={<AuthorApplicationsPage />} />
-              <Route path="/app/authors" element={<AuthorManagementPage />} />
+              <Route 
+                path="/app/author-applications" 
+                element={
+                  <RequireSuperAuthorRoute>
+                    <AuthorApplicationsPage />
+                  </RequireSuperAuthorRoute>
+                } 
+              />
+              <Route 
+                path="/app/authors" 
+                element={
+                  <RequireAuthorRoute>
+                    <AuthorManagementPage />
+                  </RequireAuthorRoute>
+                } 
+              />
 
               {/* 404 Route */}
               <Route path="*" element={<NotFoundPage />} />

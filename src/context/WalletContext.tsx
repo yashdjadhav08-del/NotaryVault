@@ -5,11 +5,14 @@ import {
   isChainIdMatchingNetwork,
   getContractAdmin,
   checkIsOnChainAuthor,
+  isContractConfigured,
+  getOnChainSuperAuthor,
+  getContractAddressForNetwork,
+  verifyContractCapabilities,
   type MSTNetworkKey,
   type MSTNetworkDefinition
 } from '../services/contractService';
 import type { AuthorRole } from '../types';
-import { loadAuthorizedAuthors } from '../lib/storage';
 
 export type WalletConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type { MSTNetworkKey, MSTNetworkDefinition };
@@ -30,6 +33,9 @@ export interface WalletContextType {
   provider: any;
   error: string | null;
   contractAdminAddress: string | null;
+  contractAddress: string;
+  contractVerificationStatus: 'checking' | 'verified' | 'unverified' | 'rpc_error' | 'not_configured';
+  contractVerificationError: string | null;
   isAdminWallet: boolean;
   isRegistrar: boolean;
   role: AuthorRole;
@@ -37,7 +43,11 @@ export interface WalletContextType {
   isSecondaryAuthor: boolean;
   isAuthor: boolean;
   isPublicUser: boolean;
+  onChainSuperAuthorAddress: string | null;
+  isVerifiedOnChainSuperAuthor: boolean;
+  canDeployMainnetContract: boolean;
   refreshAuthorRoles: () => void;
+  refreshContractConfig: () => void;
   connectWallet: () => Promise<void>;
   cancelConnection: () => void;
   disconnectWallet: () => void;
@@ -71,7 +81,7 @@ export const CHAIN_PARAMS_BY_NETWORK: Record<MSTNetworkKey, {
       symbol: 'MSTC',
       decimals: 18,
     },
-    rpcUrls: ['https://4646.rpc.thirdweb.com'],
+    rpcUrls: ['https://mariorpc.mstblockchain.com', 'https://4646.rpc.thirdweb.com'],
     blockExplorerUrls: ['https://mstscan.com'],
   },
 };
@@ -286,7 +296,67 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   const isCorrectNetwork = Boolean(detectedNetworkKey === selectedNetwork);
   const activeNetworkConfig = MST_NETWORKS[selectedNetwork];
 
-  // Fetch authorized admin address from smart contract
+  // On-chain verified Super Author (from established contract registry)
+  const [onChainSuperAuthorAddress, setOnChainSuperAuthorAddress] = useState<string | null>(null);
+
+  // Contract verification state across networks
+  const [contractVerificationStatus, setContractVerificationStatus] = useState<
+    'checking' | 'verified' | 'unverified' | 'rpc_error' | 'not_configured'
+  >('checking');
+  const [contractVerificationError, setContractVerificationError] = useState<string | null>(null);
+
+  const contractAddress = useMemo(() => {
+    return getContractAddressForNetwork(selectedNetwork);
+  }, [selectedNetwork]);
+
+  const verifyDeploymentStatus = async (net: MSTNetworkKey) => {
+    setContractVerificationStatus('checking');
+    setContractVerificationError(null);
+
+    if (!isContractConfigured(net)) {
+      setContractVerificationStatus('not_configured');
+      setContractVerificationError(
+        net === 'mainnet'
+          ? 'No smart contract address configured for MST Chain Mainnet.'
+          : 'No smart contract address configured.'
+      );
+      return;
+    }
+
+    try {
+      const res = await verifyContractCapabilities(net);
+      if (res.valid) {
+        setContractVerificationStatus('verified');
+        setContractVerificationError(null);
+      } else if (res.error && (res.error.toLowerCase().includes('rpc') || res.error.toLowerCase().includes('timeout') || res.error.toLowerCase().includes('network') || res.error.toLowerCase().includes('connection') || res.error.toLowerCase().includes('failed'))) {
+        setContractVerificationStatus('rpc_error');
+        setContractVerificationError(`Deployment status could not be verified on ${MST_NETWORKS[net]?.name || net}: ${res.error}`);
+      } else {
+        setContractVerificationStatus('unverified');
+        setContractVerificationError(res.error || 'Contract bytecode or interface verification failed.');
+      }
+    } catch (err: any) {
+      setContractVerificationStatus('rpc_error');
+      setContractVerificationError(`Deployment status could not be verified on ${MST_NETWORKS[net]?.name || net}: ${err?.message || 'RPC communication failure'}`);
+    }
+  };
+
+  const fetchOnChainSuperAuthor = () => {
+    getOnChainSuperAuthor(selectedNetwork)
+      .then(adminAddr => {
+        if (adminAddr) {
+          setOnChainSuperAuthorAddress(adminAddr);
+        }
+      })
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    fetchOnChainSuperAuthor();
+    verifyDeploymentStatus(selectedNetwork);
+  }, [selectedNetwork]);
+
+  // Fetch authorized admin address from smart contract for selectedNetwork
   useEffect(() => {
     let isMounted = true;
     getContractAdmin(selectedNetwork)
@@ -301,22 +371,72 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     };
   }, [selectedNetwork]);
 
-  const isSuperAuthor = useMemo(() => {
-    if (!address || !contractAdminAddress) return false;
-    return address.trim().toLowerCase() === contractAdminAddress.trim().toLowerCase();
-  }, [address, contractAdminAddress]);
+  // Listen to in-app contract deployment events
+  useEffect(() => {
+    const handleDeployed = () => {
+      getContractAdmin(selectedNetwork).then(addr => {
+        if (addr) setContractAdminAddress(addr);
+      });
+      fetchOnChainSuperAuthor();
+      verifyDeploymentStatus(selectedNetwork);
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('notaryvault:mainnet-deployed', handleDeployed);
+    }
+    return () => {
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('notaryvault:mainnet-deployed', handleDeployed);
+      }
+    };
+  }, [selectedNetwork]);
 
-  // Track active secondary authors from storage and chain
-  const [activeSecondaryAuthors, setActiveSecondaryAuthors] = useState<string[]>(() => {
-    return loadAuthorizedAuthors().filter(a => a.isActive).map(a => a.walletAddress.toLowerCase());
-  });
+  const refreshContractConfig = () => {
+    getContractAdmin(selectedNetwork).then(addr => {
+      if (addr) setContractAdminAddress(addr);
+    });
+    fetchOnChainSuperAuthor();
+    verifyDeploymentStatus(selectedNetwork);
+  };
 
+  // Verified on-chain Super Author matching connected wallet
+  const isVerifiedOnChainSuperAuthor = useMemo(() => {
+    if (!address) return false;
+    const cleanAddr = address.trim().toLowerCase();
+    if (onChainSuperAuthorAddress && cleanAddr === onChainSuperAuthorAddress.trim().toLowerCase()) {
+      return true;
+    }
+    if (contractAdminAddress && cleanAddr === contractAdminAddress.trim().toLowerCase()) {
+      return true;
+    }
+    return false;
+  }, [address, onChainSuperAuthorAddress, contractAdminAddress]);
+
+  const isSuperAuthor = isVerifiedOnChainSuperAuthor;
+
+  // Strict check: can deploy Mainnet contract?
+  const canDeployMainnetContract = useMemo(() => {
+    // 1. Must be connected
+    if (status !== 'connected' || !address) return false;
+    // 2. Must be verified on-chain as Super Author
+    if (!isVerifiedOnChainSuperAuthor) return false;
+    // 3. Must be connected to MST Chain Mainnet (chainId === 4646 / 0x1226)
+    if (!chainId || !isChainIdMatchingNetwork(chainId, 'mainnet')) return false;
+    // 4. No valid contract already configured on Mainnet
+    if (isContractConfigured('mainnet')) return false;
+    // 5. If contract is verified, or RPC is unavailable, do NOT allow duplicate deployment
+    if (contractVerificationStatus === 'verified' || contractVerificationStatus === 'rpc_error') return false;
+    return true;
+  }, [status, address, isVerifiedOnChainSuperAuthor, chainId, contractVerificationStatus]);
+
+  // Track on-chain secondary author status
   const [isChainSecondaryAuthor, setIsChainSecondaryAuthor] = useState<boolean>(false);
 
   const refreshAuthorRoles = () => {
-    setActiveSecondaryAuthors(
-      loadAuthorizedAuthors().filter(a => a.isActive).map(a => a.walletAddress.toLowerCase())
-    );
+    if (address && !isSuperAuthor) {
+      checkIsOnChainAuthor(address, selectedNetwork)
+        .then(res => setIsChainSecondaryAuthor(res))
+        .catch(() => {});
+    }
   };
 
   useEffect(() => {
@@ -335,9 +455,8 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
 
   const isSecondaryAuthor = useMemo(() => {
     if (!address || isSuperAuthor) return false;
-    const clean = address.trim().toLowerCase();
-    return isChainSecondaryAuthor || activeSecondaryAuthors.includes(clean);
-  }, [address, isSuperAuthor, isChainSecondaryAuthor, activeSecondaryAuthors]);
+    return Boolean(isChainSecondaryAuthor);
+  }, [address, isSuperAuthor, isChainSecondaryAuthor]);
 
   const isAuthor = isSuperAuthor || isSecondaryAuthor;
   const isPublicUser = !isAuthor;
@@ -524,6 +643,9 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         isProviderAvailable: Boolean(activeProvider),
         provider: activeProvider,
         contractAdminAddress,
+        contractAddress,
+        contractVerificationStatus,
+        contractVerificationError,
         isAdminWallet,
         isRegistrar,
         role,
@@ -531,7 +653,11 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         isSecondaryAuthor,
         isAuthor,
         isPublicUser,
+        onChainSuperAuthorAddress,
+        isVerifiedOnChainSuperAuthor,
+        canDeployMainnetContract,
         refreshAuthorRoles,
+        refreshContractConfig,
         error,
         connectWallet,
         cancelConnection,

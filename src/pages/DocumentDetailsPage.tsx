@@ -48,8 +48,7 @@ import {
   downloadLocalPDF, 
   LOCAL_STORAGE_DISCLAIMER,
   downloadVerifiedOriginalPDF,
-  requestAuthChallenge,
-  verifyAuthSignature,
+  authenticateOwnerWithWallet,
   getClientSession,
   createPrivateAccessToken,
   shareDocumentWithDelivery,
@@ -78,7 +77,9 @@ export const DocumentDetailsPage: React.FC = () => {
     provider, 
     selectedNetwork, 
     activeNetworkConfig, 
-    isCorrectNetwork 
+    isCorrectNetwork,
+    isAuthor,
+    isSuperAuthor
   } = useWallet();
 
   const catalogDoc = getDocumentById(id || '');
@@ -121,6 +122,17 @@ export const DocumentDetailsPage: React.FC = () => {
 
   const doc = catalogDoc || onChainDoc;
 
+  // Strict check: Only the document's registered owner/author or Super Author has permission to share
+  const canManageAndShare = React.useMemo(() => {
+    if (!walletAddress || !doc) return false;
+    if (isSuperAuthor) return true;
+    if (!isAuthor) return false;
+    const activeWallet = walletAddress.trim().toLowerCase();
+    const docRegistrant = (doc.registrantAddress || '').trim().toLowerCase();
+    const docOwner = (doc.owner || '').trim().toLowerCase();
+    return activeWallet === docRegistrant || activeWallet === docOwner;
+  }, [walletAddress, doc, isSuperAuthor, isAuthor]);
+
   const [hasPdfLocally, setHasPdfLocally] = useState<boolean | null>(null);
 
   React.useEffect(() => {
@@ -132,6 +144,7 @@ export const DocumentDetailsPage: React.FC = () => {
   const [copiedHash, setCopiedHash] = useState(false);
   const [copiedTxHash, setCopiedTxHash] = useState(false);
   const [copiedVerifyUrl, setCopiedVerifyUrl] = useState(false);
+  const [copiedOwner, setCopiedOwner] = useState(false);
   const [isAnchoring, setIsAnchoring] = useState(false);
   const [isRevoking, setIsRevoking] = useState(false);
   const [mainnetActionModal, setMainnetActionModal] = useState<'anchor' | 'revoke' | null>(null);
@@ -166,41 +179,15 @@ export const DocumentDetailsPage: React.FC = () => {
     setDownloadResult(null);
 
     try {
-      let session = getClientSession();
-      const activeAddr = walletAddress?.toLowerCase();
-      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
-
-      if (!isSessionValid) {
-        if (walletStatus !== 'connected' || !provider || !walletAddress) {
-          addToast('Wallet Connection Required', 'Please connect your owner wallet to authenticate private document access.', 'warning');
-          setIsDownloading(false);
-          return;
-        }
-
-        const challenge = await requestAuthChallenge(walletAddress);
-        if (!challenge.success || !challenge.challengeText) {
-          throw new Error(challenge.error || 'Could not obtain authentication challenge.');
-        }
-
-        const signer = await provider.getSigner();
-        const signature = await signer.signMessage(challenge.challengeText);
-
-        const verifyRes = await verifyAuthSignature({
-          address: walletAddress,
-          signature,
-          challengeId: challenge.challengeId,
-          challengeText: challenge.challengeText,
-        });
-
-        if (!verifyRes.success || !verifyRes.session) {
-          throw new Error(verifyRes.error || 'Server authorization rejected cryptographic signature.');
-        }
-        session = verifyRes.session;
+      if (walletStatus !== 'connected' || !provider || !walletAddress) {
+        throw new Error('Wallet is disconnected. Please reconnect your wallet.');
       }
 
-      if (!session) {
-        throw new Error('Authentication session could not be established.');
-      }
+      const session = await authenticateOwnerWithWallet(
+        provider,
+        walletAddress,
+        { expectedNetworkKey: (doc.networkKey || selectedNetwork) as any }
+      );
 
       const res = await downloadVerifiedOriginalPDF(
         doc.id,
@@ -233,37 +220,15 @@ export const DocumentDetailsPage: React.FC = () => {
     if (!doc) return;
     setIsCreatingToken(true);
     try {
-      let session = getClientSession();
-      const activeAddr = walletAddress?.toLowerCase();
-      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
-
-      if (!isSessionValid) {
-        if (walletStatus !== 'connected' || !provider || !walletAddress) {
-          addToast('Wallet Required', 'Connect your owner wallet to generate access tokens.', 'warning');
-          setIsCreatingToken(false);
-          return;
-        }
-
-        const challenge = await requestAuthChallenge(walletAddress);
-        const signer = await provider.getSigner();
-        const signature = await signer.signMessage(challenge.challengeText);
-
-        const verifyRes = await verifyAuthSignature({
-          address: walletAddress,
-          signature,
-          challengeId: challenge.challengeId,
-          challengeText: challenge.challengeText,
-        });
-
-        if (!verifyRes.success || !verifyRes.session) {
-          throw new Error(verifyRes.error || 'Signature rejected.');
-        }
-        session = verifyRes.session;
+      if (walletStatus !== 'connected' || !provider || !walletAddress) {
+        throw new Error('Wallet is disconnected. Please reconnect your wallet.');
       }
 
-      if (!session) {
-        throw new Error('Authentication session could not be established.');
-      }
+      const session = await authenticateOwnerWithWallet(
+        provider,
+        walletAddress,
+        { expectedNetworkKey: (doc.networkKey || selectedNetwork) as any }
+      );
 
       const res = await createPrivateAccessToken(
         doc.id,
@@ -323,15 +288,21 @@ export const DocumentDetailsPage: React.FC = () => {
     );
   }
 
-  // Filter activities related to this document
-  const docActivities = activities.filter(a => a.documentId === doc.id);
+  // Filter activities related to this document and network
+  const docActivities = activities.filter(
+    a => a.documentId === doc.id && (!a.networkKey || a.networkKey === (doc.networkKey || 'testnet'))
+  );
 
-  const copyToClipboard = (text: string, type: 'hash' | 'link') => {
+  const copyToClipboard = (text: string, type: 'hash' | 'link' | 'owner') => {
     navigator.clipboard.writeText(text);
     if (type === 'hash') {
       setCopiedHash(true);
       setTimeout(() => setCopiedHash(false), 2000);
       addToast('SHA-256 Copied', 'Hash fingerprint copied to clipboard.');
+    } else if (type === 'owner') {
+      setCopiedOwner(true);
+      setTimeout(() => setCopiedOwner(false), 2000);
+      addToast('Owner Address Copied', 'Wallet address copied to clipboard.');
     } else {
       setCopiedVerifyUrl(true);
       setTimeout(() => setCopiedVerifyUrl(false), 2000);
@@ -400,43 +371,15 @@ export const DocumentDetailsPage: React.FC = () => {
     setIsSharing(true);
 
     try {
-      // 1. Authenticate owner session with cryptographic signature
-      let session = getClientSession();
-      const activeAddr = walletAddress?.toLowerCase();
-      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
-
-      if (!isSessionValid) {
-        if (walletStatus !== 'connected' || !provider || !walletAddress) {
-          addToast('Wallet Connection Required', 'Please connect your owner wallet to authorize document sharing.', 'warning');
-          setShareError('Owner wallet connection is required for cryptographic authorization.');
-          setIsSharing(false);
-          return;
-        }
-
-        const challenge = await requestAuthChallenge(walletAddress);
-        if (!challenge.success || !challenge.challengeText) {
-          throw new Error(challenge.error || 'Failed to obtain authentication challenge.');
-        }
-
-        const signer = await provider.getSigner();
-        const signature = await signer.signMessage(challenge.challengeText);
-
-        const verifyRes = await verifyAuthSignature({
-          address: walletAddress,
-          signature,
-          challengeId: challenge.challengeId,
-          challengeText: challenge.challengeText,
-        });
-
-        if (!verifyRes.success || !verifyRes.session) {
-          throw new Error(verifyRes.error || 'Cryptographic signature rejected by server.');
-        }
-        session = verifyRes.session;
+      if (walletStatus !== 'connected' || !provider || !walletAddress) {
+        throw new Error('Wallet is disconnected. Please reconnect your wallet.');
       }
 
-      if (!session) {
-        throw new Error('Authentication session could not be established.');
-      }
+      const session = await authenticateOwnerWithWallet(
+        provider,
+        walletAddress,
+        { expectedNetworkKey: (doc.networkKey || selectedNetwork) as any }
+      );
 
       // 2. Dispatch sharing & server-side delivery with on-chain SHA-256 verification (Email only)
       const res = await shareDocumentWithDelivery({
@@ -454,6 +397,20 @@ export const DocumentDetailsPage: React.FC = () => {
       setShareDeliveryResult(res);
 
       if (res.success) {
+        if (sendPdfByEmail) {
+          if (res.emailDelivery?.status === 'accepted') {
+            addToast('Document Shared & Email Delivered', `Original PDF successfully dispatched to ${shareEmail.trim()}.`);
+          } else if (res.emailDelivery?.status === 'unconfigured') {
+            addToast('Share Link Created', 'Secure access link created. Email provider is not configured in environment.', 'warning');
+          } else if (res.emailDelivery?.status === 'failed') {
+            addToast('Email Delivery Failed', res.emailDelivery.error || 'Email delivery failed. Please check the email provider configuration.', 'error');
+          } else {
+            addToast('Document Shared', 'Document share reference created.');
+          }
+        } else {
+          addToast('Document Shared', 'Secure document access link created.');
+        }
+
         // Record in client activity context
         const durationDisplay = expiryPolicy === 'never' ? 'No Fixed Expiry' : expiryPolicy;
         await shareDocument({
@@ -463,15 +420,16 @@ export const DocumentDetailsPage: React.FC = () => {
           durationLabel: durationDisplay,
         });
 
-        addToast('Document Shared', 'Document share reference created and email dispatched.');
         loadShares();
       } else {
-        setShareError(res.error || 'Failed to share document.');
-        addToast('Share Failed', res.error || 'Delivery failed.', 'error');
+        const errorMsg = res.error || 'Failed to share document.';
+        setShareError(errorMsg);
+        addToast('Share Failed', errorMsg, 'error');
       }
     } catch (err: any) {
-      setShareError(err?.message || 'Authorization failed.');
-      addToast('Share Error', err?.message || 'Failed to dispatch document share.', 'error');
+      const displayMsg = err?.message || 'Authorization failed. Please reconnect your wallet and retry.';
+      setShareError(displayMsg);
+      addToast('Share Error', displayMsg, 'error');
     } finally {
       setIsSharing(false);
     }
@@ -494,14 +452,16 @@ export const DocumentDetailsPage: React.FC = () => {
           >
             Library
           </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={<Share2 className="w-4 h-4" />}
-            onClick={() => setShareModalOpen(true)}
-          >
-            Share
-          </Button>
+          {canManageAndShare && (
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Share2 className="w-4 h-4" />}
+              onClick={() => setShareModalOpen(true)}
+            >
+              Share
+            </Button>
+          )}
           <Button
             variant="primary-app"
             size="sm"
@@ -553,7 +513,7 @@ export const DocumentDetailsPage: React.FC = () => {
 
             {/* Quick Action Buttons */}
             <div className="flex items-center gap-3">
-              {hasPdfLocally && (
+              {hasPdfLocally && canManageAndShare && (
                 <Button
                   variant="secondary"
                   size="sm"
@@ -571,14 +531,16 @@ export const DocumentDetailsPage: React.FC = () => {
               >
                 Download Receipt
               </Button>
-              <Button
-                variant="primary-app"
-                size="sm"
-                icon={<Share2 className="w-4 h-4" />}
-                onClick={() => setShareModalOpen(true)}
-              >
-                Share Reference
-              </Button>
+              {canManageAndShare && (
+                <Button
+                  variant="primary-app"
+                  size="sm"
+                  icon={<Share2 className="w-4 h-4" />}
+                  onClick={() => setShareModalOpen(true)}
+                >
+                  Share Reference
+                </Button>
+              )}
             </div>
 
           </div>
@@ -632,12 +594,32 @@ export const DocumentDetailsPage: React.FC = () => {
 
               {/* Attributes Grid */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-                <div className="p-4 bg-stone-50 rounded-xl border border-black/5">
+                <div className="p-4 bg-stone-50 rounded-xl border border-black/5 min-w-0 overflow-hidden">
                   <div className="flex items-center gap-2 text-stone-500 font-medium mb-1">
-                    <User className="w-3.5 h-3.5" />
+                    <User className="w-3.5 h-3.5 shrink-0" />
                     <span>Registered Owner / Submitter</span>
                   </div>
-                  <div className="text-sm font-bold text-stone-900">{doc.owner}</div>
+                  <div className="flex items-center justify-between gap-2 min-w-0">
+                    <div 
+                      id="registered-owner-address"
+                      className="text-xs sm:text-sm font-bold text-stone-900 font-mono break-all [overflow-wrap:anywhere] select-all min-w-0 flex-1 leading-snug"
+                      title={doc.owner}
+                    >
+                      {doc.owner}
+                    </div>
+                    {doc.owner && (
+                      <button
+                        type="button"
+                        id="copy-owner-address-btn"
+                        onClick={() => copyToClipboard(doc.owner, 'owner')}
+                        className="p-1.5 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-black/5 shrink-0 transition-colors cursor-pointer"
+                        title="Copy Owner Address"
+                        aria-label="Copy Owner Address"
+                      >
+                        {copiedOwner ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="p-4 bg-stone-50 rounded-xl border border-black/5">
@@ -723,34 +705,40 @@ export const DocumentDetailsPage: React.FC = () => {
                     </div>
                   )}
 
-                  <div className="pt-1 flex flex-wrap items-center gap-2.5">
-                    <Button
-                      id="owner-download-verified-pdf-btn"
-                      type="button"
-                      variant="primary-app"
-                      size="sm"
-                      loading={isDownloading}
-                      icon={<Download className="w-3.5 h-3.5" />}
-                      onClick={handleAuthenticatedDownload}
-                      className="text-xs"
-                    >
-                      Download Verified PDF (Signed Auth)
-                    </Button>
+                  {canManageAndShare ? (
+                    <div className="pt-1 flex flex-wrap items-center gap-2.5">
+                      <Button
+                        id="owner-download-verified-pdf-btn"
+                        type="button"
+                        variant="primary-app"
+                        size="sm"
+                        loading={isDownloading}
+                        icon={<Download className="w-3.5 h-3.5" />}
+                        onClick={handleAuthenticatedDownload}
+                        className="text-xs"
+                      >
+                        Download Verified PDF (Signed Auth)
+                      </Button>
 
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      icon={<Key className="w-3.5 h-3.5 text-stone-600" />}
-                      onClick={() => {
-                        setCreatedTokenInfo(null);
-                        setAccessTokenModalOpen(true);
-                      }}
-                      className="text-xs"
-                    >
-                      Create Private Access Link
-                    </Button>
-                  </div>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        icon={<Key className="w-3.5 h-3.5 text-stone-600" />}
+                        onClick={() => {
+                          setCreatedTokenInfo(null);
+                          setAccessTokenModalOpen(true);
+                        }}
+                        className="text-xs"
+                      >
+                        Create Private Access Link
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="pt-1 text-[11px] text-stone-500 italic bg-white/70 p-2.5 rounded-lg border border-black/5">
+                      Original PDF file download and private access link generation are restricted to authorized authors and the verified document owner.
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -766,79 +754,81 @@ export const DocumentDetailsPage: React.FC = () => {
               </div>
             </Card>
 
-            {/* Active Document Shares & Real-time Revocation (Requirement 4) */}
-            <Card className="p-6 space-y-4 border border-black/10">
-              <div className="flex items-center justify-between pb-3 border-b border-black/[0.06]">
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-blue-50 text-[#1F6FF0] flex items-center justify-center">
-                    <Share2 className="w-4 h-4" />
+            {/* Active Document Shares & Real-time Revocation (Requirement 4) - Authorized Owner Only */}
+            {canManageAndShare && (
+              <Card className="p-6 space-y-4 border border-black/10">
+                <div className="flex items-center justify-between pb-3 border-b border-black/[0.06]">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-blue-50 text-[#1F6FF0] flex items-center justify-center">
+                      <Share2 className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-[#1C1C1C]">
+                        Active External Shares & Expiry Policies
+                      </h3>
+                      <p className="text-[11px] text-stone-500">
+                        Manage cryptographic access links and revoke recipient permissions in real time.
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <h3 className="text-sm font-bold text-[#1C1C1C]">
-                      Active External Shares & Expiry Policies
-                    </h3>
-                    <p className="text-[11px] text-stone-500">
-                      Manage cryptographic access links and revoke recipient permissions in real time.
-                    </p>
-                  </div>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={loadShares}
+                    icon={<RefreshCw className="w-3.5 h-3.5" />}
+                    className="text-xs"
+                  >
+                    Refresh
+                  </Button>
                 </div>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={loadShares}
-                  icon={<RefreshCw className="w-3.5 h-3.5" />}
-                  className="text-xs"
-                >
-                  Refresh
-                </Button>
-              </div>
 
-              {activeShares.length === 0 ? (
-                <div className="p-4 bg-stone-50/70 rounded-xl text-center text-xs text-stone-500">
-                  No active external shares recorded on the server for this document. Use <strong>Share Reference</strong> to deliver by email.
-                </div>
-              ) : (
-                <div className="divide-y divide-black/5 text-xs">
-                  {activeShares.map(sh => (
-                    <div key={sh.share_id} className="py-3 flex items-center justify-between gap-4 flex-wrap">
-                      <div className="space-y-0.5 min-w-[200px]">
-                        <div className="font-semibold text-stone-900 flex items-center gap-1.5">
-                          {sh.recipient_email ? (
-                            <span className="flex items-center gap-1"><Mail className="w-3.5 h-3.5 text-stone-400" />{sh.recipient_email}</span>
-                          ) : sh.recipient_mobile ? (
-                            <span className="flex items-center gap-1"><Phone className="w-3.5 h-3.5 text-stone-400" />{sh.recipient_mobile}</span>
+                {activeShares.length === 0 ? (
+                  <div className="p-4 bg-stone-50/70 rounded-xl text-center text-xs text-stone-500">
+                    No active external shares recorded on the server for this document. Use <strong>Share Reference</strong> to deliver by email.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-black/5 text-xs">
+                    {activeShares.map(sh => (
+                      <div key={sh.share_id} className="py-3 flex items-center justify-between gap-4 flex-wrap">
+                        <div className="space-y-0.5 min-w-[200px]">
+                          <div className="font-semibold text-stone-900 flex items-center gap-1.5">
+                            {sh.recipient_email ? (
+                              <span className="flex items-center gap-1"><Mail className="w-3.5 h-3.5 text-stone-400" />{sh.recipient_email}</span>
+                            ) : sh.recipient_mobile ? (
+                              <span className="flex items-center gap-1"><Phone className="w-3.5 h-3.5 text-stone-400" />{sh.recipient_mobile}</span>
+                            ) : (
+                              <span>Confidential Recipient</span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-stone-500 flex items-center gap-2">
+                            <span>Policy: <strong className="text-stone-700">{sh.access_policy === 'never' ? 'No Fixed Expiry' : sh.access_policy}</strong></span>
+                            <span>•</span>
+                            <span>Expires: {sh.expires_at ? formatDate(sh.expires_at) : 'Never (Manual Revocation Only)'}</span>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          {sh.is_revoked ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-700">
+                              Revoked
+                            </span>
                           ) : (
-                            <span>Confidential Recipient</span>
+                            <Button
+                              variant="danger"
+                              size="sm"
+                              className="text-[11px] py-1 px-2.5 h-auto"
+                              onClick={() => handleRevokeShare(sh.share_id)}
+                            >
+                              Revoke Access
+                            </Button>
                           )}
                         </div>
-                        <div className="text-[11px] text-stone-500 flex items-center gap-2">
-                          <span>Policy: <strong className="text-stone-700">{sh.access_policy === 'never' ? 'No Fixed Expiry' : sh.access_policy}</strong></span>
-                          <span>•</span>
-                          <span>Expires: {sh.expires_at ? formatDate(sh.expires_at) : 'Never (Manual Revocation Only)'}</span>
-                        </div>
                       </div>
-
-                      <div className="flex items-center gap-2">
-                        {sh.is_revoked ? (
-                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-700">
-                            Revoked
-                          </span>
-                        ) : (
-                          <Button
-                            variant="danger"
-                            size="sm"
-                            className="text-[11px] py-1 px-2.5 h-auto"
-                            onClick={() => handleRevokeShare(sh.share_id)}
-                          >
-                            Revoke Access
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </Card>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            )}
 
             {/* MST Chain Testnet Smart Contract Registry Card */}
             <Card className="p-6 space-y-5 border border-black/10">
@@ -848,9 +838,18 @@ export const DocumentDetailsPage: React.FC = () => {
                     <LinkIcon className="w-4 h-4" />
                   </div>
                   <div>
-                    <h3 className="text-base font-bold text-[#1C1C1C]">
-                      MST Chain Testnet Verification
-                    </h3>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h3 className="text-base font-bold text-[#1C1C1C]">
+                        {doc.networkKey === 'mainnet' ? 'MST Chain Mainnet Verification' : 'MST Chain Testnet Verification'}
+                      </h3>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wide border ${
+                        doc.networkKey === 'mainnet'
+                          ? 'bg-purple-100 text-purple-900 border-purple-200'
+                          : 'bg-blue-100 text-blue-900 border-blue-200'
+                      }`}>
+                        {doc.networkKey === 'mainnet' ? 'MAINNET' : 'TESTNET'}
+                      </span>
+                    </div>
                     <p className="text-[11px] text-stone-500">
                       Immutable document registry contract anchoring
                     </p>
@@ -927,7 +926,7 @@ export const DocumentDetailsPage: React.FC = () => {
                             rel="noreferrer"
                             className="text-purple-700 hover:underline flex items-center gap-1 text-[11px] font-semibold"
                           >
-                            <span>MSTScan</span>
+                            <span>{doc.networkKey === 'mainnet' ? 'MSTScan (Mainnet)' : 'MSTScan (Testnet)'}</span>
                             <ExternalLink className="w-3 h-3" />
                           </a>
                         </div>
@@ -957,43 +956,45 @@ export const DocumentDetailsPage: React.FC = () => {
                         rel="noreferrer"
                         className="text-purple-700 hover:underline flex items-center gap-1 text-[11px] font-semibold shrink-0 ml-2"
                       >
-                        <span>Contract</span>
+                        <span>{doc.networkKey === 'mainnet' ? 'Contract (Mainnet)' : 'Contract (Testnet)'}</span>
                         <ExternalLink className="w-3 h-3" />
                       </a>
                     </div>
                   )}
 
-                  {/* Revoke Action */}
-                  <div className="pt-2 flex justify-end">
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      loading={isRevoking}
-                      icon={<Flame className="w-3.5 h-3.5 text-rose-600" />}
-                      className="border-rose-200 text-rose-700 hover:bg-rose-50 text-xs"
-                      onClick={async () => {
-                        if (walletStatus !== 'connected' || !provider) {
-                          addToast('Wallet Disconnected', 'Connect BridgeKey wallet to revoke on-chain.', 'warning');
-                          return;
-                        }
-                        const netKey = doc.networkKey || selectedNetwork;
-                        if (netKey === 'mainnet') {
-                          setMainnetActionModal('revoke');
-                          return;
-                        }
-                        if (window.confirm(`Permanently revoke document ${doc.id} on ${MST_NETWORKS[netKey].name}? This action is irrevocable.`)) {
-                          setIsRevoking(true);
-                          try {
-                            await revokeDocumentOnChain(doc.id, 'Revoked by registrant', provider, netKey);
-                          } finally {
-                            setIsRevoking(false);
+                  {/* Revoke Action (Authors only) */}
+                  {isAuthor && (
+                    <div className="pt-2 flex justify-end">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        loading={isRevoking}
+                        icon={<Flame className="w-3.5 h-3.5 text-rose-600" />}
+                        className="border-rose-200 text-rose-700 hover:bg-rose-50 text-xs"
+                        onClick={async () => {
+                          if (walletStatus !== 'connected' || !provider) {
+                            addToast('Wallet Disconnected', 'Connect BridgeKey wallet to revoke on-chain.', 'warning');
+                            return;
                           }
-                        }
-                      }}
-                    >
-                      Revoke On-Chain
-                    </Button>
-                  </div>
+                          const netKey = doc.networkKey || selectedNetwork;
+                          if (netKey === 'mainnet') {
+                            setMainnetActionModal('revoke');
+                            return;
+                          }
+                          if (window.confirm(`Permanently revoke document ${doc.id} on ${MST_NETWORKS[netKey].name}? This action is irrevocable.`)) {
+                            setIsRevoking(true);
+                            try {
+                              await revokeDocumentOnChain(doc.id, 'Revoked by registrant', provider, netKey);
+                            } finally {
+                              setIsRevoking(false);
+                            }
+                          }
+                        }}
+                      >
+                        Revoke On-Chain
+                      </Button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-3 text-xs">
@@ -1001,35 +1002,41 @@ export const DocumentDetailsPage: React.FC = () => {
                     This document is stored in the local catalog. You can anchor its SHA-256 fingerprint permanently to the NotaryVault smart contract on <strong>{activeNetworkConfig.name}</strong>.
                   </p>
                   <div className="flex flex-wrap items-center gap-3 pt-1">
-                    <Button
-                      variant="primary-app"
-                      size="sm"
-                      loading={isAnchoring}
-                      icon={<LinkIcon className="w-3.5 h-3.5" />}
-                      className={selectedNetwork === 'mainnet' ? 'bg-purple-600 hover:bg-purple-700 text-white' : ''}
-                      onClick={async () => {
-                        if (walletStatus !== 'connected' || !provider) {
-                          addToast('Connect Wallet', 'Please connect your BridgeKey wallet first.', 'warning');
-                          return;
-                        }
-                        if (!isCorrectNetwork) {
-                          addToast('Network Mismatch', `Please switch your wallet to ${activeNetworkConfig.name}.`, 'warning');
-                          return;
-                        }
-                        if (selectedNetwork === 'mainnet') {
-                          setMainnetActionModal('anchor');
-                          return;
-                        }
-                        setIsAnchoring(true);
-                        try {
-                          await registerExistingDocumentOnChain(doc.id, provider, selectedNetwork);
-                        } finally {
-                          setIsAnchoring(false);
-                        }
-                      }}
-                    >
-                      Anchor to {activeNetworkConfig.name}
-                    </Button>
+                    {isAuthor ? (
+                      <Button
+                        variant="primary-app"
+                        size="sm"
+                        loading={isAnchoring}
+                        icon={<LinkIcon className="w-3.5 h-3.5" />}
+                        className={selectedNetwork === 'mainnet' ? 'bg-purple-600 hover:bg-purple-700 text-white' : ''}
+                        onClick={async () => {
+                          if (walletStatus !== 'connected' || !provider) {
+                            addToast('Connect Wallet', 'Please connect your BridgeKey wallet first.', 'warning');
+                            return;
+                          }
+                          if (!isCorrectNetwork) {
+                            addToast('Network Mismatch', `Please switch your wallet to ${activeNetworkConfig.name}.`, 'warning');
+                            return;
+                          }
+                          if (selectedNetwork === 'mainnet') {
+                            setMainnetActionModal('anchor');
+                            return;
+                          }
+                          setIsAnchoring(true);
+                          try {
+                            await registerExistingDocumentOnChain(doc.id, provider, selectedNetwork);
+                          } finally {
+                            setIsAnchoring(false);
+                          }
+                        }}
+                      >
+                        Anchor to {activeNetworkConfig.name}
+                      </Button>
+                    ) : (
+                      <span className="text-[11px] text-stone-500 italic bg-stone-100 px-2.5 py-1.5 rounded-lg border border-black/5">
+                        Document anchoring to MST Chain is restricted to authorized authors.
+                      </span>
+                    )}
                     {!isContractConfigured(selectedNetwork) && (
                       <span className="text-[11px] text-amber-700 bg-amber-50 px-2 py-1 rounded-lg border border-amber-200">
                         Contract not deployed to {activeNetworkConfig.name}. Run <code className="font-mono">{selectedNetwork === 'mainnet' ? 'npm run deploy:mst:mainnet' : 'npm run deploy:mst'}</code>
@@ -1061,8 +1068,22 @@ export const DocumentDetailsPage: React.FC = () => {
                     <div key={act.id} className="flex items-start gap-3.5 text-xs pb-3.5 border-b border-black/[0.04] last:border-none last:pb-0">
                       <div className="w-2.5 h-2.5 rounded-full bg-[#1F6FF0] mt-1 shrink-0" />
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-bold text-[#1C1C1C]">{act.title}</span>
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-[#1C1C1C]">{act.title}</span>
+                            <span className={`px-1.5 py-0.2 rounded text-[9px] font-extrabold uppercase border ${
+                              act.networkKey === 'mainnet'
+                                ? 'bg-purple-50 text-purple-800 border-purple-200'
+                                : 'bg-blue-50 text-blue-800 border-blue-200'
+                            }`}>
+                              {act.networkKey === 'mainnet' ? 'MAINNET' : 'TESTNET'}
+                            </span>
+                            {act.isOnChain && (
+                              <span className="px-1.5 py-0.2 rounded text-[9px] font-bold uppercase bg-emerald-50 text-emerald-800 border border-emerald-200">
+                                Confirmed On-Chain
+                              </span>
+                            )}
+                          </div>
                           <span className="text-[11px] text-stone-400 font-mono">
                             {formatDateTime(act.timestamp)}
                           </span>
@@ -1070,6 +1091,20 @@ export const DocumentDetailsPage: React.FC = () => {
                         <p className="text-stone-500 text-xs mt-0.5 leading-relaxed">
                           {act.description}
                         </p>
+                        {act.txHash && (
+                          <div className="mt-1 flex items-center gap-2 text-[10px] font-mono">
+                            <span className="text-stone-400">Tx:</span>
+                            <a
+                              href={getExplorerTxUrl(act.txHash, act.networkKey || selectedNetwork)}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-[#1F6FF0] hover:underline flex items-center gap-0.5 font-semibold"
+                            >
+                              <span>{act.txHash.slice(0, 14)}...</span>
+                              <ExternalLink className="w-2.5 h-2.5" />
+                            </a>
+                          </div>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -1310,66 +1345,136 @@ export const DocumentDetailsPage: React.FC = () => {
           )}
 
           {/* Delivery Status Card after Send */}
-          {shareDeliveryResult && (
-            <div className="p-4 bg-stone-50 rounded-xl border border-black/10 space-y-3">
-              <div className="flex items-center gap-2 text-xs font-bold text-stone-900">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span>Share Reference Generated</span>
-              </div>
+          {shareDeliveryResult && (() => {
+            const isEmailReq = Boolean(sendPdfByEmail);
+            const emailStatus = shareDeliveryResult.emailDelivery?.status;
+            const isEmailFailed = isEmailReq && emailStatus === 'failed';
+            const isEmailUnconfigured = isEmailReq && emailStatus === 'unconfigured';
+            const isEmailAccepted = isEmailReq && emailStatus === 'accepted';
 
-              {/* Email Status */}
-              {sendPdfByEmail && (
-                <div className="flex items-center justify-between text-xs p-2.5 bg-white rounded-lg border border-black/5">
-                  <span className="font-semibold text-stone-700 flex items-center gap-1.5">
-                    <Mail className="w-3.5 h-3.5 text-stone-500" />
-                    <span>Email Delivery:</span>
-                  </span>
-                  <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${
-                    shareDeliveryResult.emailDelivery?.status === 'accepted'
-                      ? 'bg-emerald-100 text-emerald-800'
-                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
-                      ? 'bg-amber-100 text-amber-800'
-                      : 'bg-rose-100 text-rose-800'
-                  }`}>
-                    {shareDeliveryResult.emailDelivery?.status === 'accepted'
-                      ? 'Accepted by Provider'
-                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
-                      ? 'Provider Not Configured'
-                      : 'Delivery Failed'}
-                  </span>
-                </div>
-              )}
-
-              {/* Secure Link */}
-              {shareDeliveryResult.secureAccessUrl && (
-                <div className="space-y-1">
-                  <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
-                    Secure Access URL
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <input
-                      readOnly
-                      value={shareDeliveryResult.secureAccessUrl}
-                      className="flex-1 text-xs font-mono bg-white p-2 rounded border border-black/10 select-all"
-                    />
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      icon={copiedShareLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                      onClick={() => {
-                        navigator.clipboard.writeText(shareDeliveryResult.secureAccessUrl || '');
-                        setCopiedShareLink(true);
-                        setTimeout(() => setCopiedShareLink(false), 2000);
-                      }}
-                    >
-                      {copiedShareLink ? 'Copied' : 'Copy'}
-                    </Button>
+            return (
+              <div className={`p-4 rounded-xl border space-y-3 ${
+                isEmailFailed 
+                  ? 'bg-rose-50/70 border-rose-200' 
+                  : isEmailUnconfigured 
+                  ? 'bg-amber-50/70 border-amber-200' 
+                  : 'bg-emerald-50/50 border-emerald-200'
+              }`}>
+                {/* State-Accurate Header */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-xs font-bold">
+                    {isEmailFailed ? (
+                      <>
+                        <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                        <span className="text-rose-900">Email Delivery Failed</span>
+                      </>
+                    ) : isEmailUnconfigured ? (
+                      <>
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span className="text-amber-900">Share Reference Generated (Email Not Sent)</span>
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span className="text-emerald-900">
+                          {isEmailAccepted ? 'Document Shared & Email Dispatched' : 'Secure Access Link Generated'}
+                        </span>
+                      </>
+                    )}
                   </div>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                    isEmailFailed
+                      ? 'bg-rose-100 text-rose-800 border border-rose-300'
+                      : isEmailUnconfigured
+                      ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                      : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                  }`}>
+                    {isEmailFailed
+                      ? 'Delivery Failed'
+                      : isEmailUnconfigured
+                      ? 'Provider Unconfigured'
+                      : isEmailAccepted
+                      ? 'Accepted by Provider'
+                      : 'Direct Link Created'}
+                  </span>
                 </div>
-              )}
-            </div>
-          )}
+
+                {/* Diagnostic Error Box when Email Fails */}
+                {isEmailFailed && (
+                  <div className="p-3 bg-white/90 rounded-lg border border-rose-200/80 text-xs space-y-1.5">
+                    <div className="font-semibold text-rose-900 flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                      <span>Failure Explanation:</span>
+                    </div>
+                    <p className="text-rose-800 text-[11px] leading-relaxed break-words font-medium">
+                      {shareDeliveryResult.emailDelivery?.error || 'The email provider rejected the delivery request.'}
+                    </p>
+                    <p className="text-[10px] text-stone-500 pt-1 border-t border-rose-100">
+                      Note: A secure access token was created, but the email could not be delivered to <span className="font-semibold text-stone-700">{shareEmail}</span>. You can copy the link below to share it manually.
+                    </p>
+                  </div>
+                )}
+
+                {/* Diagnostic Notice when Provider Unconfigured */}
+                {isEmailUnconfigured && (
+                  <div className="p-3 bg-white/90 rounded-lg border border-amber-200 text-xs space-y-1">
+                    <p className="text-amber-900 text-[11px] leading-relaxed">
+                      {shareDeliveryResult.emailDelivery?.error || 'No email delivery provider is configured in environment (.env). Configure RESEND_API_KEY or SMTP settings to enable automated dispatch.'}
+                    </p>
+                  </div>
+                )}
+
+                {/* Provider Acceptance Details */}
+                {isEmailAccepted && (
+                  <div className="p-2.5 bg-white/80 rounded-lg border border-emerald-200 text-xs text-emerald-900 space-y-0.5">
+                    <p className="text-[11px] leading-relaxed">
+                      Send request accepted by provider{shareDeliveryResult.emailDelivery?.deliveryId ? ` (ID: ${shareDeliveryResult.emailDelivery.deliveryId})` : ''}. Verified PDF attached.
+                    </p>
+                  </div>
+                )}
+
+                {/* Email Delivery Detail Row */}
+                {isEmailReq && (
+                  <div className="flex items-center justify-between text-xs p-2.5 bg-white rounded-lg border border-black/5">
+                    <span className="font-semibold text-stone-700 flex items-center gap-1.5">
+                      <Mail className="w-3.5 h-3.5 text-stone-500" />
+                      <span>Recipient:</span>
+                    </span>
+                    <span className="font-mono text-stone-800 text-xs">{shareEmail}</span>
+                  </div>
+                )}
+
+                {/* Secure Link */}
+                {shareDeliveryResult.secureAccessUrl && (
+                  <div className="space-y-1 pt-1">
+                    <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
+                      Secure Access URL
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        readOnly
+                        value={shareDeliveryResult.secureAccessUrl}
+                        className="flex-1 text-xs font-mono bg-white p-2 rounded border border-black/10 select-all"
+                      />
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        icon={copiedShareLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                        onClick={() => {
+                          navigator.clipboard.writeText(shareDeliveryResult.secureAccessUrl || '');
+                          setCopiedShareLink(true);
+                          setTimeout(() => setCopiedShareLink(false), 2000);
+                        }}
+                      >
+                        {copiedShareLink ? 'Copied' : 'Copy'}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
 
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/[0.06]">
             <Button

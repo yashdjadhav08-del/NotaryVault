@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import type { ReactNode } from 'react';
 import { generateApplicationId } from '../lib/id';
 import { 
@@ -8,11 +8,16 @@ import {
   saveAuthorizedAuthors 
 } from '../lib/storage';
 import { 
-  authorizeAuthorOnChain, 
   deauthorizeAuthorOnChain,
   submitAuthorApplicationOnChain,
-  reviewAuthorApplicationOnChain
+  reviewAuthorApplicationOnChain,
+  fetchAllOnChainAuthorApplications,
+  getOnChainApplicationStatus,
+  isContractConfigured,
+  isChainIdMatchingNetwork,
+  MST_NETWORKS
 } from '../services/contractService';
+import type { MSTNetworkKey } from '../services/contractService';
 import { useWallet } from './WalletContext';
 import { useDocuments } from './DocumentContext';
 import type { 
@@ -33,6 +38,9 @@ interface AuthorContextType {
   applications: AuthorApplication[];
   authorizedAuthors: AuthorizedAuthorRecord[];
   pendingApplicationsCount: number;
+  isSyncingOnChain: boolean;
+  syncError: string | null;
+  syncOnChainApplications: (targetNet?: MSTNetworkKey) => Promise<AuthorApplication[]>;
   submitApplication: (params: SubmitApplicationParams, rawProvider?: any) => Promise<AuthorApplication>;
   reviewApplication: (
     appId: string, 
@@ -50,23 +58,127 @@ const AuthorContext = createContext<AuthorContextType | undefined>(undefined);
 export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const { 
     address, 
+    chainId: walletChainId,
     isSuperAuthor, 
     selectedNetwork, 
     refreshAuthorRoles 
   } = useWallet();
   const { addToast } = useDocuments();
 
-  const [applications, setApplications] = useState<AuthorApplication[]>(() => loadAuthorApplications());
-  const [authorizedAuthors, setAuthorizedAuthors] = useState<AuthorizedAuthorRecord[]>(() => loadAuthorizedAuthors());
+  const [applications, setApplications] = useState<AuthorApplication[]>(() => loadAuthorApplications(selectedNetwork));
+  const [authorizedAuthors, setAuthorizedAuthors] = useState<AuthorizedAuthorRecord[]>(() => loadAuthorizedAuthors(selectedNetwork));
+  const [isSyncingOnChain, setIsSyncingOnChain] = useState<boolean>(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
 
-  // Save to persistent storage whenever updated
+  // Save to persistent storage whenever updated for the active network
   useEffect(() => {
-    saveAuthorApplications(applications);
-  }, [applications]);
+    saveAuthorApplications(applications, selectedNetwork);
+  }, [applications, selectedNetwork]);
 
   useEffect(() => {
-    saveAuthorizedAuthors(authorizedAuthors);
-  }, [authorizedAuthors]);
+    saveAuthorizedAuthors(authorizedAuthors, selectedNetwork);
+  }, [authorizedAuthors, selectedNetwork]);
+
+  /**
+   * Syncs applications with the on-chain registry contract.
+   * On-chain records from the blockchain are authoritative.
+   * Any off-chain-only local records are preserved but marked isOnChain: false.
+   */
+  const syncOnChainApplications = useCallback(async (
+    targetNet: MSTNetworkKey = selectedNetwork
+  ): Promise<AuthorApplication[]> => {
+    if (!isContractConfigured(targetNet)) {
+      setIsSyncingOnChain(false);
+      setSyncError(null);
+      const localOnly = loadAuthorApplications(targetNet);
+      setApplications(localOnly);
+      return localOnly;
+    }
+
+    setIsSyncingOnChain(true);
+    setSyncError(null);
+
+    try {
+      const res = await fetchAllOnChainAuthorApplications(targetNet);
+      if (!res.success) {
+        setSyncError(res.error || 'Failed to sync applications from blockchain node.');
+        setIsSyncingOnChain(false);
+        return applications;
+      }
+
+      const onChainApps = res.applications;
+      const onChainWallets = new Set(onChainApps.map(a => a.applicantWallet.toLowerCase()));
+
+      // Read current local storage applications for targetNet
+      const localApps = loadAuthorApplications(targetNet);
+
+      // Merge: on-chain records supersede local drafts for same wallet
+      const merged: AuthorApplication[] = [...onChainApps];
+
+      for (const loc of localApps) {
+        const cleanLocWallet = loc.applicantWallet.toLowerCase();
+        if (!onChainWallets.has(cleanLocWallet)) {
+          // Off-chain only application (e.g. historical unsubmitted draft)
+          merged.push({
+            ...loc,
+            networkKey: targetNet,
+            isOnChain: false,
+            submissionTxHash: loc.submissionTxHash || undefined,
+          });
+        }
+      }
+
+      setApplications(merged);
+      saveAuthorApplications(merged, targetNet);
+
+      // Auto-update authorized authors if any on-chain application is approved
+      for (const app of onChainApps) {
+        if (app.status === 'Approved') {
+          setAuthorizedAuthors(prev => {
+            const cleanAppWallet = app.applicantWallet.toLowerCase();
+            const exists = prev.some(a => a.walletAddress.toLowerCase() === cleanAppWallet && a.isActive);
+            if (!exists) {
+              const newRec: AuthorizedAuthorRecord = {
+                walletAddress: app.applicantWallet,
+                name: app.applicantName,
+                organization: app.organization,
+                licenseNumber: app.licenseNumber,
+                role: 'secondary_author',
+                authorizedAt: app.reviewedAt || app.submittedAt,
+                authorizedBy: app.reviewedBy || 'Super Author',
+                txHash: app.approvalTxHash,
+                isActive: true,
+                networkKey: targetNet,
+              };
+              const updated = [newRec, ...prev.filter(a => a.walletAddress.toLowerCase() !== cleanAppWallet)];
+              saveAuthorizedAuthors(updated, targetNet);
+              return updated;
+            }
+            return prev;
+          });
+        }
+      }
+
+      setIsSyncingOnChain(false);
+      return merged;
+    } catch (err: any) {
+      setSyncError(err?.message || 'Error syncing on-chain applications');
+      setIsSyncingOnChain(false);
+      return applications;
+    }
+  }, [selectedNetwork, applications]);
+
+  // Reactive reload and sync whenever selected network changes
+  useEffect(() => {
+    setApplications(loadAuthorApplications(selectedNetwork));
+    setAuthorizedAuthors(loadAuthorizedAuthors(selectedNetwork));
+    if (isContractConfigured(selectedNetwork)) {
+      syncOnChainApplications(selectedNetwork);
+    } else {
+      setIsSyncingOnChain(false);
+      setSyncError(null);
+    }
+  }, [selectedNetwork]);
 
   const pendingApplicationsCount = applications.filter(a => a.status === 'Pending').length;
 
@@ -87,18 +199,29 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     rawProvider?: any
   ): Promise<AuthorApplication> => {
     if (!address) {
-      throw new Error('Please connect your BridgeKey or EVM wallet to submit an author application.');
+      throw new Error('Please connect your wallet to submit an author application.');
+    }
+
+    if (!rawProvider) {
+      throw new Error('Wallet connection provider is required to broadcast on-chain author application transaction.');
+    }
+
+    if (!isContractConfigured(selectedNetwork)) {
+      if (selectedNetwork === 'mainnet') {
+        throw new Error(
+          'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED: Smart contract has not been deployed to MST Chain Mainnet (Chain ID 4646). Author applications cannot proceed.'
+        );
+      }
+      throw new Error(`Smart contract is not configured on ${MST_NETWORKS[selectedNetwork].name}.`);
+    }
+
+    if (walletChainId && !isChainIdMatchingNetwork(walletChainId, selectedNetwork)) {
+      throw new Error(
+        `Wallet network mismatch. Connected to chain ID ${walletChainId}, but selected network is ${MST_NETWORKS[selectedNetwork].name} (${MST_NETWORKS[selectedNetwork].chainIdDecimal}). Please switch networks in your wallet before submitting.`
+      );
     }
 
     const cleanWallet = address.trim().toLowerCase();
-
-    // Check for duplicate pending applications
-    const existingPending = applications.find(
-      a => a.applicantWallet.toLowerCase() === cleanWallet && a.status === 'Pending'
-    );
-    if (existingPending) {
-      throw new Error(`A pending author application (${existingPending.id}) is already registered for wallet ${address.slice(0, 6)}...${address.slice(-4)}. Please await review by the Super Author.`);
-    }
 
     // Check if already an active authorized author
     const alreadyAuthor = authorizedAuthors.find(
@@ -108,34 +231,27 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       throw new Error('This wallet is already an active authorized Secondary Author.');
     }
 
-    const appId = generateApplicationId();
-    let submissionTxHash: string | undefined = undefined;
+    // Check on-chain status to prevent duplicate reverts
+    const onChainStatus = await getOnChainApplicationStatus(address, selectedNetwork);
+    if (onChainStatus === 1) { // 1 = Pending
+      throw new Error(`A pending author application is already registered on-chain for wallet ${address.slice(0, 6)}...${address.slice(-4)}. Please await review by the Super Author.`);
+    }
 
-    // If wallet provider is available, attempt on-chain registration on supported contract
-    if (rawProvider) {
-      const chainRes = await submitAuthorApplicationOnChain(
-        appId,
-        params.applicantName.trim(),
-        params.organization.trim(),
-        params.contactEmail.trim(),
-        params.justification.trim(),
-        rawProvider,
-        selectedNetwork
-      );
-      if (chainRes.success && chainRes.txHash) {
-        submissionTxHash = chainRes.txHash;
-        addToast(
-          'On-Chain Application Submitted',
-          `Application recorded on ${selectedNetwork}. Tx: ${chainRes.txHash.slice(0, 10)}...`,
-          'success'
-        );
-      } else if (chainRes.error) {
-        addToast(
-          'Application Notice',
-          `On-chain submission: ${chainRes.error}. Application stored locally for workflow.`,
-          'info'
-        );
-      }
+    const appId = generateApplicationId();
+
+    // Submit strictly on-chain; require confirmed receipt
+    const chainRes = await submitAuthorApplicationOnChain(
+      appId,
+      params.applicantName.trim(),
+      params.organization.trim(),
+      params.contactEmail.trim(),
+      params.justification.trim(),
+      rawProvider,
+      selectedNetwork
+    );
+
+    if (!chainRes.success || !chainRes.txHash) {
+      throw new Error(chainRes.error || 'Blockchain transaction was rejected or reverted. Application was not submitted.');
     }
 
     const newApp: AuthorApplication = {
@@ -148,15 +264,21 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       justification: params.justification.trim(),
       submittedAt: new Date().toISOString(),
       status: 'Pending',
-      submissionTxHash,
+      submissionTxHash: chainRes.txHash,
+      submissionBlockNumber: chainRes.blockNumber,
       networkKey: selectedNetwork,
+      isOnChain: true,
     };
 
-    setApplications(prev => [newApp, ...prev]);
+    setApplications(prev => {
+      const updated = [newApp, ...prev.filter(a => a.applicantWallet.toLowerCase() !== cleanWallet)];
+      saveAuthorApplications(updated, selectedNetwork);
+      return updated;
+    });
 
     addToast(
-      'Application Submitted',
-      `Application ${newApp.id} submitted for Super Author review.`,
+      'Application Submitted On-Chain',
+      `Application ${newApp.id} confirmed on ${selectedNetwork}. Block: ${chainRes.blockNumber || 'confirmed'}. Tx: ${chainRes.txHash.slice(0, 10)}...`,
       'success'
     );
 
@@ -173,43 +295,48 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       throw new Error('Unauthorized Caller: Only the designated Super Author can review author applications.');
     }
 
-    const targetApp = applications.find(a => a.id === appId);
+    if (!rawProvider) {
+      throw new Error('Connected Super Author wallet is required to sign the review transaction.');
+    }
+
+    if (!isContractConfigured(selectedNetwork)) {
+      if (selectedNetwork === 'mainnet') {
+        throw new Error(
+          'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED: Smart contract has not been deployed to MST Chain Mainnet (Chain ID 4646). Application review cannot proceed.'
+        );
+      }
+      throw new Error(`Smart contract is not configured on ${MST_NETWORKS[selectedNetwork].name}.`);
+    }
+
+    if (walletChainId && !isChainIdMatchingNetwork(walletChainId, selectedNetwork)) {
+      throw new Error(
+        `Wallet network mismatch. Connected to chain ID ${walletChainId}, but selected network is ${MST_NETWORKS[selectedNetwork].name} (${MST_NETWORKS[selectedNetwork].chainIdDecimal}). Please switch networks in your wallet before submitting.`
+      );
+    }
+
+    const cleanQuery = appId.trim().toLowerCase();
+    const targetApp = applications.find(
+      a => a.id.toLowerCase() === cleanQuery || a.applicantWallet.toLowerCase() === cleanQuery
+    );
     if (!targetApp) {
       throw new Error(`Application ${appId} not found.`);
     }
 
-    let approvalTxHash: string | undefined = undefined;
+    // Call reviewAuthorApplicationOnChain on the active deployed contract
+    const chainRes = await reviewAuthorApplicationOnChain(
+      targetApp.applicantWallet,
+      decision === 'Approved',
+      notes || '',
+      rawProvider,
+      selectedNetwork
+    );
 
-    if (rawProvider) {
-      // Try reviewAuthorApplicationOnChain first
-      let chainRes = await reviewAuthorApplicationOnChain(
-        targetApp.applicantWallet,
-        decision === 'Approved',
-        notes || '',
-        rawProvider,
-        selectedNetwork
-      );
-
-      // If contract does not have reviewAuthorApplication, fallback to direct authorizeAuthorOnChain for approval
-      if (!chainRes.success && decision === 'Approved') {
-        chainRes = await authorizeAuthorOnChain(targetApp.applicantWallet, rawProvider, selectedNetwork);
-      }
-
-      if (chainRes.success && chainRes.txHash) {
-        approvalTxHash = chainRes.txHash;
-        addToast(
-          decision === 'Approved' ? 'On-Chain Author Authorized' : 'On-Chain Review Broadcast',
-          `Broadcasted to ${selectedNetwork}. Tx: ${chainRes.txHash.slice(0, 10)}...`,
-          'success'
-        );
-      } else if (chainRes.error) {
-        addToast(
-          'Smart Contract Notice',
-          `On-chain call: ${chainRes.error}. Role assignment updated locally.`,
-          'info'
-        );
-      }
+    if (!chainRes.success || !chainRes.txHash) {
+      throw new Error(chainRes.error || 'On-chain review transaction was rejected or failed.');
     }
+
+    const approvalTxHash = chainRes.txHash;
+    const approvalBlockNumber = chainRes.blockNumber;
 
     if (decision === 'Approved') {
       // Add to Authorized Authors list
@@ -229,7 +356,7 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       setAuthorizedAuthors(prev => {
         const filtered = prev.filter(a => a.walletAddress.toLowerCase() !== targetApp.applicantWallet.toLowerCase());
         const updated = [newAuthorRecord, ...filtered];
-        saveAuthorizedAuthors(updated);
+        saveAuthorizedAuthors(updated, selectedNetwork);
         return updated;
       });
 
@@ -238,25 +365,34 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     }
 
     // Update application record
-    setApplications(prev => prev.map(a => {
-      if (a.id === appId) {
-        return {
-          ...a,
-          status: decision as ApplicationStatus,
-          reviewedAt: new Date().toISOString(),
-          reviewedBy: address || 'Super Author',
-          reviewNotes: notes?.trim() || undefined,
-          approvalTxHash: approvalTxHash || a.approvalTxHash,
-        };
-      }
-      return a;
-    }));
+    setApplications(prev => {
+      const updated = prev.map(a => {
+        if (a.id.toLowerCase() === targetApp.id.toLowerCase() || a.applicantWallet.toLowerCase() === targetApp.applicantWallet.toLowerCase()) {
+          return {
+            ...a,
+            status: decision as ApplicationStatus,
+            reviewedAt: new Date().toISOString(),
+            reviewedBy: address || 'Super Author',
+            reviewNotes: notes?.trim() || undefined,
+            approvalTxHash,
+            approvalBlockNumber,
+            isOnChain: true,
+          };
+        }
+        return a;
+      });
+      saveAuthorApplications(updated, selectedNetwork);
+      return updated;
+    });
 
     addToast(
-      `Application ${decision}`,
-      `Application ${appId} for ${targetApp.applicantName} marked as ${decision}.`,
+      `Application ${decision} On-Chain`,
+      `Application ${targetApp.id} for ${targetApp.applicantName} marked as ${decision} on ${selectedNetwork}. Tx: ${approvalTxHash.slice(0, 10)}...`,
       decision === 'Approved' ? 'success' : 'warning'
     );
+
+    // Sync from blockchain to ensure on-chain state is up to date
+    syncOnChainApplications(selectedNetwork);
 
     return true;
   };
@@ -270,6 +406,21 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
       throw new Error('Unauthorized Caller: Only the designated Super Author can revoke author permissions.');
     }
 
+    if (!isContractConfigured(selectedNetwork)) {
+      if (selectedNetwork === 'mainnet') {
+        throw new Error(
+          'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED: Smart contract has not been deployed to MST Chain Mainnet (Chain ID 4646). Deauthorization cannot proceed.'
+        );
+      }
+      throw new Error(`Smart contract is not configured on ${MST_NETWORKS[selectedNetwork].name}.`);
+    }
+
+    if (walletChainId && !isChainIdMatchingNetwork(walletChainId, selectedNetwork)) {
+      throw new Error(
+        `Wallet network mismatch. Connected to chain ID ${walletChainId}, but selected network is ${MST_NETWORKS[selectedNetwork].name} (${MST_NETWORKS[selectedNetwork].chainIdDecimal}). Please switch networks in your wallet before submitting.`
+      );
+    }
+
     const clean = walletAddress.trim().toLowerCase();
     const existing = authorizedAuthors.find(a => a.walletAddress.toLowerCase() === clean);
     if (!existing) {
@@ -278,24 +429,29 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
 
     if (rawProvider) {
       const chainRes = await deauthorizeAuthorOnChain(walletAddress, rawProvider, selectedNetwork);
-      if (chainRes.success && chainRes.txHash) {
-        addToast(
-          'On-Chain Deauthorization Confirmed',
-          `Revoked on ${selectedNetwork}. Tx: ${chainRes.txHash.slice(0, 10)}...`,
-          'info'
-        );
+      if (!chainRes.success || !chainRes.txHash) {
+        throw new Error(chainRes.error || 'On-chain deauthorization failed.');
       }
+      addToast(
+        'On-Chain Deauthorization Confirmed',
+        `Revoked on ${selectedNetwork}. Tx: ${chainRes.txHash.slice(0, 10)}...`,
+        'info'
+      );
     }
 
-    setAuthorizedAuthors(prev => prev.map(a => {
-      if (a.walletAddress.toLowerCase() === clean) {
-        return {
-          ...a,
-          isActive: false,
-        };
-      }
-      return a;
-    }));
+    setAuthorizedAuthors(prev => {
+      const updated = prev.map(a => {
+        if (a.walletAddress.toLowerCase() === clean) {
+          return {
+            ...a,
+            isActive: false,
+          };
+        }
+        return a;
+      });
+      saveAuthorizedAuthors(updated, selectedNetwork);
+      return updated;
+    });
 
     refreshAuthorRoles();
 
@@ -314,6 +470,9 @@ export const AuthorProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         applications,
         authorizedAuthors,
         pendingApplicationsCount,
+        isSyncingOnChain,
+        syncError,
+        syncOnChainApplications,
         submitApplication,
         reviewApplication,
         deauthorizeAuthor,

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { AppShell } from '../components/layout/AppShell';
 import { Card } from '../components/ui/Card';
@@ -8,7 +8,7 @@ import { StatusPill } from '../components/ui/StatusPill';
 import { Modal } from '../components/ui/Modal';
 import { EmptyState } from '../components/ui/EmptyState';
 import { useDocuments } from '../context/DocumentContext';
-import type { SharedRecord } from '../types';
+import type { SharedRecord, DocumentRecord } from '../types';
 import { 
   PlusCircle, 
   Search, 
@@ -24,22 +24,32 @@ import { formatDate } from '../lib/format';
 import { useWallet } from '../context/WalletContext';
 import { 
   shareDocumentWithDelivery, 
-  requestAuthChallenge, 
-  verifyAuthSignature, 
-  getClientSession, 
+  authenticateOwnerWithWallet,
   type DocumentShareResult 
 } from '../lib/pdfStorage';
 
 export const SharedDocumentsPage: React.FC = () => {
   const { documents, sharedRecords, shareDocument, revokeSharing, addToast } = useDocuments();
-  const { address: walletAddress, status: walletStatus, provider } = useWallet();
+  const { address: walletAddress, status: walletStatus, provider, isAuthor, isSuperAuthor, selectedNetwork } = useWallet();
+
+  const shareableDocuments = useMemo<DocumentRecord[]>(() => {
+    if (!isAuthor) return [];
+    if (isSuperAuthor) return documents;
+    if (!walletAddress) return [];
+    const addr = walletAddress.trim().toLowerCase();
+    return documents.filter((d: DocumentRecord) => {
+      const reg = (d.registrantAddress || '').trim().toLowerCase();
+      const owner = (d.owner || '').trim().toLowerCase();
+      return reg === addr || owner === addr;
+    });
+  }, [documents, isAuthor, isSuperAuthor, walletAddress]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
   // Share Modal State
   const [shareModalOpen, setShareModalOpen] = useState(false);
-  const [selectedDocId, setSelectedDocId] = useState(documents[0]?.id || '');
+  const [selectedDocId, setSelectedDocId] = useState(shareableDocuments[0]?.id || documents[0]?.id || '');
   const [recipientEmail, setRecipientEmail] = useState('');
   const [sendPdfByEmail, setSendPdfByEmail] = useState(true);
   const [recipientConsent, setRecipientConsent] = useState(true);
@@ -69,6 +79,17 @@ export const SharedDocumentsPage: React.FC = () => {
     setShareError('');
     setShareDeliveryResult(null);
 
+    if (!isAuthor) {
+      setShareError('Document sharing is restricted to authorized authors.');
+      return;
+    }
+
+    const docToShare = shareableDocuments.find((d: DocumentRecord) => d.id === selectedDocId);
+    if (!docToShare) {
+      setShareError('You are only authorized to share documents you registered or manage.');
+      return;
+    }
+
     if (!selectedDocId) {
       setShareError('Please select a document to share.');
       return;
@@ -89,36 +110,15 @@ export const SharedDocumentsPage: React.FC = () => {
     setIsSubmittingShare(true);
 
     try {
-      let session = getClientSession();
-      const activeAddr = walletAddress?.toLowerCase();
-      const isSessionValid = session && (!activeAddr || session.walletAddress.toLowerCase() === activeAddr);
-
-      if (!isSessionValid) {
-        if (walletStatus !== 'connected' || !provider || !walletAddress) {
-          addToast('Wallet Connection Required', 'Please connect your owner wallet to authorize document sharing.', 'warning');
-          setShareError('Owner wallet connection required for authorization.');
-          setIsSubmittingShare(false);
-          return;
-        }
-
-        const challenge = await requestAuthChallenge(walletAddress);
-        const signer = await provider.getSigner();
-        const signature = await signer.signMessage(challenge.challengeText);
-
-        const verifyRes = await verifyAuthSignature({
-          address: walletAddress,
-          signature,
-          challengeId: challenge.challengeId,
-          challengeText: challenge.challengeText,
-        });
-
-        if (!verifyRes.success || !verifyRes.session) {
-          throw new Error(verifyRes.error || 'Authentication signature rejected.');
-        }
-        session = verifyRes.session;
+      if (walletStatus !== 'connected' || !provider || !walletAddress) {
+        throw new Error('Wallet is disconnected. Please reconnect your wallet.');
       }
 
-      if (!session) throw new Error('Session could not be established.');
+      const session = await authenticateOwnerWithWallet(
+        provider,
+        walletAddress,
+        { expectedNetworkKey: selectedNetwork }
+      );
 
       const res = await shareDocumentWithDelivery({
         documentId: selectedDocId,
@@ -135,6 +135,20 @@ export const SharedDocumentsPage: React.FC = () => {
       setShareDeliveryResult(res);
 
       if (res.success) {
+        if (sendPdfByEmail) {
+          if (res.emailDelivery?.status === 'accepted') {
+            addToast('Document Shared & Email Delivered', `Original PDF successfully dispatched to ${recipientEmail.trim()}.`);
+          } else if (res.emailDelivery?.status === 'unconfigured') {
+            addToast('Share Link Created', 'Secure access link created. Email provider is not configured in environment.', 'warning');
+          } else if (res.emailDelivery?.status === 'failed') {
+            addToast('Email Delivery Failed', res.emailDelivery.error || 'Email delivery failed. Please check the email provider configuration.', 'error');
+          } else {
+            addToast('Document Shared', 'Document share reference created.');
+          }
+        } else {
+          addToast('Document Shared', 'Secure document access link created.');
+        }
+
         const durationDisplay = expiryPolicy === 'never' ? 'No Fixed Expiry' : expiryPolicy;
         await shareDocument({
           documentId: selectedDocId,
@@ -142,15 +156,15 @@ export const SharedDocumentsPage: React.FC = () => {
           durationDays: expiryPolicy === '1h' ? 0.04 : (expiryPolicy === '24h' ? 1 : (expiryPolicy === '7d' ? 7 : (expiryPolicy === '30d' ? 30 : (expiryPolicy === '90d' ? 90 : 365)))),
           durationLabel: durationDisplay,
         });
-
-        addToast('Document Shared', 'Document share dispatched with server-side authorization.');
       } else {
-        setShareError(res.error || 'Failed to dispatch document share.');
-        addToast('Share Failed', res.error || 'Delivery failed.', 'error');
+        const errorMsg = res.error || 'Failed to dispatch document share.';
+        setShareError(errorMsg);
+        addToast('Share Failed', errorMsg, 'error');
       }
     } catch (err: any) {
-      setShareError(err?.message || 'Authorization failed.');
-      addToast('Share Error', err?.message || 'Failed to dispatch document share.', 'error');
+      const displayMsg = err?.message || 'Authorization failed. Please reconnect your wallet and retry.';
+      setShareError(displayMsg);
+      addToast('Share Error', displayMsg, 'error');
     } finally {
       setIsSubmittingShare(false);
     }
@@ -175,19 +189,21 @@ export const SharedDocumentsPage: React.FC = () => {
       title="Shared Documents"
       subtitle="Track external document inspection references, time limits, and access permissions."
       actions={
-        <Button
-          variant="primary-app"
-          size="sm"
-          icon={<PlusCircle className="w-4 h-4" />}
-          onClick={() => {
-            if (documents.length > 0 && !selectedDocId) {
-              setSelectedDocId(documents[0].id);
-            }
-            setShareModalOpen(true);
-          }}
-        >
-          Share Document
-        </Button>
+        isAuthor ? (
+          <Button
+            variant="primary-app"
+            size="sm"
+            icon={<PlusCircle className="w-4 h-4" />}
+            onClick={() => {
+              if (documents.length > 0 && !selectedDocId) {
+                setSelectedDocId(documents[0].id);
+              }
+              setShareModalOpen(true);
+            }}
+          >
+            Share Document
+          </Button>
+        ) : null
       }
     >
       <div className="space-y-6">
@@ -222,12 +238,15 @@ export const SharedDocumentsPage: React.FC = () => {
         {sharedRecords.length === 0 ? (
           <EmptyState
             title="No shared documents"
-            description={documents.length > 0 
-              ? "No documents have been shared yet. Grant time-limited inspection references to outside reviewers."
-              : "No documents have been shared yet. Register a document first to generate sharing references."
+            description={
+              isAuthor
+                ? documents.length > 0
+                  ? "No documents have been shared yet. Grant time-limited inspection references to outside reviewers."
+                  : "No documents have been shared yet. Register a document first to generate sharing references."
+                : "Sharing documents and access permissions are restricted to authorized authors and document owners."
             }
-            actionLabel={documents.length > 0 ? "Share a Document" : undefined}
-            onAction={documents.length > 0 ? () => setShareModalOpen(true) : undefined}
+            actionLabel={isAuthor && documents.length > 0 ? "Share a Document" : undefined}
+            onAction={isAuthor && documents.length > 0 ? () => setShareModalOpen(true) : undefined}
           />
         ) : filteredShared.length === 0 ? (
           <EmptyState
@@ -309,7 +328,7 @@ export const SharedDocumentsPage: React.FC = () => {
                             {copiedId === item.id ? <CheckCircle2 className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
                           </button>
 
-                          {item.status === 'Active' && (
+                          {item.status === 'Active' && isAuthor && (
                             <button
                               onClick={() => setRecordToRevoke(item)}
                               className="px-2.5 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-50 rounded-lg border border-rose-200 transition-colors cursor-pointer"
@@ -355,7 +374,7 @@ export const SharedDocumentsPage: React.FC = () => {
               }}
               className="w-full bg-white text-[#1C1C1C] text-sm rounded-xl border border-black/15 py-2.5 px-3 focus:outline-none focus:ring-2 focus:ring-[#1F6FF0]/20 focus:border-[#1F6FF0]"
             >
-              {documents.map(d => (
+              {shareableDocuments.map((d: DocumentRecord) => (
                 <option key={d.id} value={d.id}>
                   {d.name} ({d.id})
                 </option>
@@ -492,67 +511,136 @@ export const SharedDocumentsPage: React.FC = () => {
           )}
 
           {/* Delivery Status Card after Send */}
-          {shareDeliveryResult && (
-            <div className="p-4 bg-stone-50 rounded-xl border border-black/10 space-y-3">
-              <div className="flex items-center gap-2 text-xs font-bold text-stone-900">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span>Share Reference Generated</span>
-              </div>
+          {shareDeliveryResult && (() => {
+            const isEmailReq = Boolean(sendPdfByEmail);
+            const emailStatus = shareDeliveryResult.emailDelivery?.status;
+            const isEmailFailed = isEmailReq && emailStatus === 'failed';
+            const isEmailUnconfigured = isEmailReq && emailStatus === 'unconfigured';
+            const isEmailAccepted = isEmailReq && emailStatus === 'accepted';
 
-              {/* Email Status */}
-              {sendPdfByEmail && (
-                <div className="flex items-center justify-between text-xs p-2.5 bg-white rounded-lg border border-black/5">
-                  <span className="font-semibold text-stone-700 flex items-center gap-1.5">
-                    <Mail className="w-3.5 h-3.5 text-stone-500" />
-                    <span>Email Delivery:</span>
-                  </span>
-                  <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${
-                    shareDeliveryResult.emailDelivery?.status === 'accepted'
-                      ? 'bg-emerald-100 text-emerald-800'
-                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
-                      ? 'bg-amber-100 text-amber-800'
-                      : 'bg-rose-100 text-rose-800'
-                  }`}>
-                    {shareDeliveryResult.emailDelivery?.status === 'accepted'
-                      ? 'Accepted by Provider'
-                      : shareDeliveryResult.emailDelivery?.status === 'unconfigured'
-                      ? 'Provider Not Configured'
-                      : 'Delivery Failed'}
-                  </span>
-                </div>
-              )}
-
-
-              {/* Secure Link */}
-              {shareDeliveryResult.secureAccessUrl && (
-                <div className="space-y-1">
-                  <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
-                    Secure Access URL
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <input
-                      readOnly
-                      value={shareDeliveryResult.secureAccessUrl}
-                      className="flex-1 text-xs font-mono bg-white p-2 rounded border border-black/10 select-all"
-                    />
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      icon={copiedShareLink ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                      onClick={() => {
-                        navigator.clipboard.writeText(shareDeliveryResult.secureAccessUrl || '');
-                        setCopiedShareLink(true);
-                        setTimeout(() => setCopiedShareLink(false), 2000);
-                      }}
-                    >
-                      {copiedShareLink ? 'Copied' : 'Copy'}
-                    </Button>
+            return (
+              <div className={`p-4 rounded-xl border space-y-3 ${
+                isEmailFailed 
+                  ? 'bg-rose-50/70 border-rose-200' 
+                  : isEmailUnconfigured 
+                  ? 'bg-amber-50/70 border-amber-200' 
+                  : 'bg-emerald-50/50 border-emerald-200'
+              }`}>
+                {/* State-Accurate Header */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-xs font-bold">
+                    {isEmailFailed ? (
+                      <>
+                        <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                        <span className="text-rose-900">Email Delivery Failed</span>
+                      </>
+                    ) : isEmailUnconfigured ? (
+                      <>
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                        <span className="text-amber-900">Share Reference Generated (Email Not Sent)</span>
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span className="text-emerald-900">
+                          {isEmailAccepted ? 'Document Shared & Email Dispatched' : 'Secure Access Link Generated'}
+                        </span>
+                      </>
+                    )}
                   </div>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                    isEmailFailed
+                      ? 'bg-rose-100 text-rose-800 border border-rose-300'
+                      : isEmailUnconfigured
+                      ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                      : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                  }`}>
+                    {isEmailFailed
+                      ? 'Delivery Failed'
+                      : isEmailUnconfigured
+                      ? 'Provider Unconfigured'
+                      : isEmailAccepted
+                      ? 'Accepted by Provider'
+                      : 'Direct Link Created'}
+                  </span>
                 </div>
-              )}
-            </div>
-          )}
+
+                {/* Diagnostic Error Box when Email Fails */}
+                {isEmailFailed && (
+                  <div className="p-3 bg-white/90 rounded-lg border border-rose-200/80 text-xs space-y-1.5">
+                    <div className="font-semibold text-rose-900 flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                      <span>Failure Explanation:</span>
+                    </div>
+                    <p className="text-rose-800 text-[11px] leading-relaxed break-words font-medium">
+                      {shareDeliveryResult.emailDelivery?.error || 'The email provider rejected the delivery request.'}
+                    </p>
+                    <p className="text-[10px] text-stone-500 pt-1 border-t border-rose-100">
+                      Note: A secure access token was created, but the email could not be delivered to <span className="font-semibold text-stone-700">{recipientEmail}</span>. You can copy the link below to share it manually.
+                    </p>
+                  </div>
+                )}
+
+                {/* Diagnostic Notice when Provider Unconfigured */}
+                {isEmailUnconfigured && (
+                  <div className="p-3 bg-white/90 rounded-lg border border-amber-200 text-xs space-y-1">
+                    <p className="text-amber-900 text-[11px] leading-relaxed">
+                      {shareDeliveryResult.emailDelivery?.error || 'No email delivery provider is configured in environment (.env). Configure RESEND_API_KEY or SMTP settings to enable automated dispatch.'}
+                    </p>
+                  </div>
+                )}
+
+                {/* Provider Acceptance Details */}
+                {isEmailAccepted && (
+                  <div className="p-2.5 bg-white/80 rounded-lg border border-emerald-200 text-xs text-emerald-900 space-y-0.5">
+                    <p className="text-[11px] leading-relaxed">
+                      Send request accepted by provider{shareDeliveryResult.emailDelivery?.deliveryId ? ` (ID: ${shareDeliveryResult.emailDelivery.deliveryId})` : ''}. Verified PDF attached.
+                    </p>
+                  </div>
+                )}
+
+                {/* Email Delivery Detail Row */}
+                {isEmailReq && (
+                  <div className="flex items-center justify-between text-xs p-2.5 bg-white rounded-lg border border-black/5">
+                    <span className="font-semibold text-stone-700 flex items-center gap-1.5">
+                      <Mail className="w-3.5 h-3.5 text-stone-500" />
+                      <span>Recipient:</span>
+                    </span>
+                    <span className="font-mono text-stone-800 text-xs">{recipientEmail}</span>
+                  </div>
+                )}
+
+                {/* Secure Link */}
+                {shareDeliveryResult.secureAccessUrl && (
+                  <div className="space-y-1 pt-1">
+                    <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">
+                      Secure Access URL
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        readOnly
+                        value={shareDeliveryResult.secureAccessUrl}
+                        className="flex-1 text-xs font-mono bg-white p-2 rounded border border-black/10 select-all"
+                      />
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        icon={copiedShareLink ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                        onClick={() => {
+                          navigator.clipboard.writeText(shareDeliveryResult.secureAccessUrl || '');
+                          setCopiedShareLink(true);
+                          setTimeout(() => setCopiedShareLink(false), 2000);
+                        }}
+                      >
+                        {copiedShareLink ? 'Copied' : 'Copy'}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
 
           <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/[0.06]">
             <Button

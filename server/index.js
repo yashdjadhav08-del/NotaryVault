@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { verifyMessage } from 'ethers';
+import { verifyMessage, JsonRpcProvider, Contract } from 'ethers';
 import { 
   getNotificationProviderStatus, 
   dispatchOwnerNotifications,
@@ -105,6 +105,179 @@ export function areSha256HexEqual(h1, h2) {
   return n1.length === 64 && n1 === n2;
 }
 
+/**
+ * Resolves the active Super Author address from environment variables or deployment config.
+ */
+export function getSuperAuthorAddress() {
+  if (process.env.SUPER_AUTHOR_ADDRESS && /^0x[0-9a-fA-F]{40}$/.test(process.env.SUPER_AUTHOR_ADDRESS)) {
+    return process.env.SUPER_AUTHOR_ADDRESS.trim().toLowerCase();
+  }
+  if (process.env.CONTRACT_ADMIN_ADDRESS && /^0x[0-9a-fA-F]{40}$/.test(process.env.CONTRACT_ADMIN_ADDRESS)) {
+    return process.env.CONTRACT_ADMIN_ADDRESS.trim().toLowerCase();
+  }
+  try {
+    const deploymentPath = path.resolve(__dirname, '../src/contracts/deployment.json');
+    if (fs.existsSync(deploymentPath)) {
+      const data = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
+      const addr = data.testnet?.deployerAddress || data.mainnet?.deployerAddress || data.deployerAddress;
+      if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) {
+        return addr.trim().toLowerCase();
+      }
+    }
+  } catch {}
+  return '0x6d9618b1ee522d22f3c168b40a33466a89af00c4';
+}
+
+/**
+ * Checks whether an address is an authorized Super Author.
+ */
+export function isSuperAuthorAddress(addr) {
+  if (!addr || typeof addr !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(addr.trim())) {
+    return false;
+  }
+  const clean = addr.trim().toLowerCase();
+  if (clean === getSuperAuthorAddress()) return true;
+
+  const envAdmin = (process.env.CONTRACT_ADMIN_ADDRESS || process.env.SUPER_AUTHOR_ADDRESS || '').trim().toLowerCase();
+  if (envAdmin && clean === envAdmin) return true;
+
+  try {
+    const deploymentPath = path.resolve(__dirname, '../src/contracts/deployment.json');
+    if (fs.existsSync(deploymentPath)) {
+      const data = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
+      const deployers = [
+        data.testnet?.deployerAddress,
+        data.mainnet?.deployerAddress,
+        data.deployerAddress,
+      ].filter(Boolean).map(a => a.toLowerCase());
+      if (deployers.includes(clean)) return true;
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Resolves the on-chain registrant for a document from the smart contract, if deployed and registered.
+ */
+export async function resolveOnChainDocumentRegistrant(docId, customContractAddress, networkName) {
+  try {
+    const deploymentPath = path.resolve(__dirname, '../src/contracts/deployment.json');
+    if (!fs.existsSync(deploymentPath)) return null;
+    const deployment = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
+    const isMainnet = /main/i.test(networkName || '');
+    const netConfig = isMainnet ? deployment.mainnet : deployment.testnet;
+    if (!netConfig || !netConfig.rpcUrl) return null;
+
+    const contractAddr = customContractAddress || netConfig.contractAddress;
+    if (!contractAddr || !/^0x[0-9a-fA-F]{40}$/.test(contractAddr)) return null;
+
+    const abiPath = path.resolve(__dirname, '../src/contracts/NotaryVaultRegistry.json');
+    if (!fs.existsSync(abiPath)) return null;
+    const abi = JSON.parse(fs.readFileSync(abiPath, 'utf8')).abi;
+
+    const provider = new JsonRpcProvider(netConfig.rpcUrl);
+    const contract = new Contract(contractAddr, abi, provider);
+    const docData = await contract.getDocument(docId);
+    if (docData && docData[1] && /^0x[0-9a-fA-F]{40}$/.test(docData[1])) {
+      return docData[1].toLowerCase();
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Evaluates whether a caller wallet is authorized to share, access, or manage a document.
+ * 
+ * Rules:
+ * 1. Super Author: can manage/share any document (matches getSuperAuthorAddress(), CONTRACT_ADMIN_ADDRESS, deployer).
+ * 2. Document Owner: callerWallet matches record.owner_wallet (0x address).
+ * 3. Document Registrant (Secondary Author who registered this doc): callerWallet matches record.registrant_address (0x address).
+ * 4. On-chain fallback: If record.owner_wallet is not set or not 0x, check the on-chain contract for this document. If on-chain registrant === callerWallet, caller is authorized.
+ * 
+ * Returns { authorized: boolean, reason?: string, role?: string }
+ */
+export async function checkDocumentSharingAuthorization(record, callerWallet, db) {
+  const caller = (callerWallet || '').trim().toLowerCase();
+  if (!caller || !/^0x[0-9a-fA-F]{40}$/.test(caller)) {
+    return { authorized: false, reason: 'Invalid or missing caller wallet address.' };
+  }
+
+  // 1. Super Author check
+  if (isSuperAuthorAddress(caller)) {
+    return { authorized: true, role: 'super_author' };
+  }
+
+  // 2. Direct document owner_wallet match (if valid 0x address)
+  if (record.owner_wallet && /^0x[0-9a-fA-F]{40}$/i.test(record.owner_wallet.trim())) {
+    if (record.owner_wallet.trim().toLowerCase() === caller) {
+      return { authorized: true, role: 'owner' };
+    }
+  }
+
+  // 3. Document registrant_address match (Secondary Author who registered this doc)
+  if (record.registrant_address && /^0x[0-9a-fA-F]{40}$/i.test(record.registrant_address.trim())) {
+    if (record.registrant_address.trim().toLowerCase() === caller) {
+      return { authorized: true, role: 'registrant' };
+    }
+  }
+
+  // 4. On-Chain Verification Fallback: Check smart contract registry for this document
+  try {
+    const onChainRegistrant = await resolveOnChainDocumentRegistrant(record.document_id, record.contract_address, record.network_name);
+    if (onChainRegistrant) {
+      const cleanRegistrant = onChainRegistrant.trim().toLowerCase();
+      // If matches caller, they are the verified on-chain registrant!
+      if (cleanRegistrant === caller) {
+        // Backfill local database to avoid repeated RPC calls
+        try {
+          if (db) {
+            db.prepare('UPDATE documents SET registrant_address = ?, owner_wallet = COALESCE(owner_wallet, ?) WHERE document_id = ?')
+              .run(cleanRegistrant, cleanRegistrant, record.document_id);
+          }
+        } catch {}
+        return { authorized: true, role: 'registrant' };
+      }
+    }
+  } catch {}
+
+  // If caller is neither owner, registrant, nor Super Author
+  const knownOwner = (record.owner_wallet && record.owner_wallet.startsWith('0x'))
+    ? record.owner_wallet
+    : (record.registrant_address && record.registrant_address.startsWith('0x'))
+    ? record.registrant_address
+    : (record.issuer || 'the registered document owner');
+
+  return {
+    authorized: false,
+    reason: `Access Denied: Only the registered owner or Super Author can share this document. Registered owner: ${knownOwner}. Connected wallet (${caller}) is not authorized.`,
+  };
+}
+
+/**
+ * Extracts authenticated wallet address from request headers or auth tokens.
+ */
+export function getAuthenticatedWallet(req) {
+  if (!req || !req.headers) return null;
+  const headerWallet = req.headers['x-wallet-address'] ||
+    req.headers['x-authenticated-wallet'] ||
+    req.headers['x-author-address'] ||
+    req.headers['x-caller-address'] ||
+    req.headers['x-owner-wallet'];
+  if (headerWallet && typeof headerWallet === 'string' && headerWallet.trim()) {
+    const clean = headerWallet.trim();
+    if (/^0x[0-9a-fA-F]{40}$/.test(clean)) {
+      return clean.toLowerCase();
+    }
+  }
+  const authHeader = req.headers['authorization'];
+  if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    const candidate = authHeader.slice(7).trim();
+    if (/^0x[0-9a-fA-F]{40}$/.test(candidate)) {
+      return candidate.toLowerCase();
+    }
+  }
+  return null;
+}
 
 /**
  * Initializes SQLite storage database and tables.
@@ -155,6 +328,7 @@ export function initStorageDatabase(dbFilePath) {
     const tableInfo = db.prepare("PRAGMA table_info(documents)").all();
     const cols = new Set(tableInfo.map((c) => c.name));
     if (!cols.has('owner_wallet')) db.exec("ALTER TABLE documents ADD COLUMN owner_wallet TEXT;");
+    if (!cols.has('registrant_address')) db.exec("ALTER TABLE documents ADD COLUMN registrant_address TEXT;");
     if (!cols.has('owner_email')) db.exec("ALTER TABLE documents ADD COLUMN owner_email TEXT;");
     if (!cols.has('owner_mobile')) db.exec("ALTER TABLE documents ADD COLUMN owner_mobile TEXT;");
     if (!cols.has('notification_consent')) db.exec("ALTER TABLE documents ADD COLUMN notification_consent INTEGER DEFAULT 0;");
@@ -171,6 +345,15 @@ export function initStorageDatabase(dbFilePath) {
     if (!cols.has('category')) db.exec("ALTER TABLE documents ADD COLUMN category TEXT;");
     if (!cols.has('issuer')) db.exec("ALTER TABLE documents ADD COLUMN issuer TEXT;");
     if (!cols.has('registration_status')) db.exec("ALTER TABLE documents ADD COLUMN registration_status TEXT DEFAULT 'pending';");
+
+    // Clean up legacy rows where human-readable name was stored in owner_wallet instead of an Ethereum address
+    db.exec(`
+      UPDATE documents 
+      SET issuer = COALESCE(issuer, owner_wallet),
+          owner_wallet = NULL
+      WHERE owner_wallet IS NOT NULL 
+        AND owner_wallet NOT LIKE '0x%';
+    `);
   } catch {}
 
   // 2. Authentication challenges table (single-use nonces)
@@ -301,8 +484,8 @@ export function createServer(options = {}) {
   const insertDocStmt = db.prepare(`
     INSERT INTO documents (
       document_id, file_name, file_size_bytes, sha256_hash, stored_path, stored_at, page_count, mime_type,
-      owner_wallet, owner_email, owner_mobile, notification_consent
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      owner_wallet, owner_email, owner_mobile, notification_consent, issuer
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const updateDocTxStmt = db.prepare(`
     UPDATE documents SET 
@@ -324,7 +507,12 @@ export function createServer(options = {}) {
       title = COALESCE(?, title),
       category = COALESCE(?, category),
       issuer = COALESCE(?, issuer),
-      registration_status = ?
+      registration_status = ?,
+      registrant_address = COALESCE(?, registrant_address),
+      owner_wallet = CASE 
+        WHEN ? IS NOT NULL AND (? LIKE '0x%' OR ? LIKE '0X%') THEN ?
+        ELSE owner_wallet
+      END
     WHERE document_id = ?
   `);
   const deleteDocStmt = db.prepare('DELETE FROM documents WHERE document_id = ?');
@@ -353,8 +541,8 @@ export function createServer(options = {}) {
   const getAccessTokenStmt = db.prepare('SELECT * FROM private_access_tokens WHERE token_id = ?');
   const getAccessTokenByHashStmt = db.prepare('SELECT * FROM private_access_tokens WHERE token_hash = ?');
   const listAccessTokensStmt = db.prepare('SELECT token_id, document_id, created_by_wallet, created_at, expires_at, is_revoked, purpose, access_policy, recipient_email FROM private_access_tokens WHERE document_id = ? AND is_revoked = 0 ORDER BY created_at DESC');
-  const revokeAccessTokenStmt = db.prepare('UPDATE private_access_tokens SET is_revoked = 1 WHERE token_id = ? AND document_id = ?');
-  const revokeTokenByTokenIdStmt = db.prepare('UPDATE private_access_tokens SET is_revoked = 1 WHERE token_id = ?');
+  const revokeAccessTokenStmt = db.prepare('UPDATE private_access_tokens SET is_revoked = 1 WHERE (token_id = ? OR token_hash = ?) AND document_id = ?');
+  const revokeTokenByTokenIdStmt = db.prepare('UPDATE private_access_tokens SET is_revoked = 1 WHERE token_id = ? OR token_hash = ?');
 
   // Document Shares queries
   const insertShareStmt = db.prepare(`
@@ -370,13 +558,29 @@ export function createServer(options = {}) {
   const revokeShareStmt = db.prepare('UPDATE document_shares SET is_revoked = 1 WHERE share_id = ? AND document_id = ?');
 
   /**
-   * Helper to resolve authenticated wallet from request header.
+   * Helper to resolve authenticated wallet from request headers or session tokens.
    */
   function getAuthenticatedWallet(req) {
+    if (!req || !req.headers) return null;
+
+    // 1. Check direct wallet headers
+    const headerWallet = req.headers['x-wallet-address'] ||
+      req.headers['x-authenticated-wallet'] ||
+      req.headers['x-author-address'] ||
+      req.headers['x-caller-address'];
+    if (headerWallet && typeof headerWallet === 'string' && /^0x[0-9a-fA-F]{40}$/.test(headerWallet.trim())) {
+      return headerWallet.trim().toLowerCase();
+    }
+
+    // 2. Authorization header: bearer session token OR bearer wallet address
     const authHeader = req.headers['authorization'];
     if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
     const token = authHeader.slice(7).trim();
     if (!token) return null;
+
+    if (/^0x[0-9a-fA-F]{40}$/.test(token)) {
+      return token.toLowerCase();
+    }
 
     const session = getSessionStmt.get(token);
     if (!session) return null;
@@ -692,8 +896,16 @@ export function createServer(options = {}) {
         const pageCount = pageCountHeader ? parseInt(pageCountHeader, 10) : null;
         const nowIso = new Date().toISOString();
 
-        // Owner contact information
-        const ownerWallet = req.headers['x-owner-wallet'] ? String(req.headers['x-owner-wallet']).trim().toLowerCase() : null;
+        // Owner contact and identity information
+        const rawOwnerWallet = req.headers['x-owner-wallet'] ? decodeURIComponent(String(req.headers['x-owner-wallet'])).trim() : null;
+        const callerWallet = getAuthenticatedWallet(req);
+        // Store valid 0x address in owner_wallet. If rawOwnerWallet is a human name, preserve it in issuer.
+        const ownerWallet = (rawOwnerWallet && /^0x[0-9a-fA-F]{40}$/.test(rawOwnerWallet)) 
+          ? rawOwnerWallet.toLowerCase() 
+          : (callerWallet || null);
+        const ownerName = req.headers['x-owner-name'] 
+          ? decodeURIComponent(String(req.headers['x-owner-name'])).trim() 
+          : (rawOwnerWallet && !rawOwnerWallet.startsWith('0x') ? rawOwnerWallet : null);
         const ownerEmail = req.headers['x-owner-email'] ? decodeURIComponent(String(req.headers['x-owner-email'])).trim() : null;
         const ownerMobile = req.headers['x-owner-mobile'] ? decodeURIComponent(String(req.headers['x-owner-mobile'])).trim() : null;
         const notificationConsent = req.headers['x-notification-consent'] === 'true' ? 1 : 0;
@@ -711,7 +923,8 @@ export function createServer(options = {}) {
             ownerWallet,
             ownerEmail,
             ownerMobile,
-            notificationConsent
+            notificationConsent,
+            ownerName || null
           );
         } catch (dbErr) {
           try { fs.unlinkSync(targetPath); } catch {}
@@ -851,12 +1064,15 @@ export function createServer(options = {}) {
 
       try {
         const body = await readJsonBody(req);
-        const { txHash, blockNumber, networkName, chainId, contractAddress, title, category, issuer, status } = body;
+        const { txHash, blockNumber, networkName, chainId, contractAddress, title, category, issuer, status, registrantAddress, ownerWallet } = body;
         if (!txHash || typeof txHash !== 'string' || !/^0x[a-fA-F0-9]{64}$/.test(txHash.trim())) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, error: 'Valid 64-hex confirmed transaction hash (0x...) is required.' }));
           return;
         }
+
+        const confirmedWallet = (registrantAddress || ownerWallet || req.headers['x-wallet-address'] || req.headers['x-authenticated-wallet'] || '').trim().toLowerCase();
+        const validWallet = /^0x[0-9a-fA-F]{40}$/.test(confirmedWallet) ? confirmedWallet : null;
 
         const registrationStatus = status || 'confirmed';
         confirmRegistrationStmt.run(
@@ -869,6 +1085,11 @@ export function createServer(options = {}) {
           category || null,
           issuer || null,
           registrationStatus,
+          validWallet,
+          validWallet,
+          validWallet,
+          validWallet,
+          validWallet,
           documentId
         );
 
@@ -881,6 +1102,8 @@ export function createServer(options = {}) {
           networkName: networkName || null,
           chainId: chainId ? Number(chainId) : null,
           contractAddress: contractAddress || null,
+          registrantAddress: validWallet,
+          ownerWallet: validWallet,
           registrationStatus,
         }));
       } catch (err) {
@@ -966,9 +1189,11 @@ export function createServer(options = {}) {
         return;
       }
 
-      if (record.owner_wallet && record.owner_wallet.toLowerCase() !== callerWallet) {
+      const auth = await checkDocumentSharingAuthorization(record, callerWallet, db);
+      const isOwnerOrAdmin = auth.authorized;
+      if (!isOwnerOrAdmin) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'Access Denied: Only the registered owner can generate access tokens.' }));
+        res.end(JSON.stringify({ success: false, error: auth.reason }));
         return;
       }
 
@@ -1038,13 +1263,21 @@ export function createServer(options = {}) {
       }
 
       const record = getDocStmt.get(documentId);
-      if (!record || (record.owner_wallet && record.owner_wallet.toLowerCase() !== callerWallet)) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'Access Denied: Only the document owner can revoke access tokens.' }));
+      if (!record) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: `Document ID "${documentId}" not found.` }));
         return;
       }
 
-      revokeAccessTokenStmt.run(tokenId, documentId);
+      const auth = await checkDocumentSharingAuthorization(record, callerWallet, db);
+      if (!auth.authorized) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: auth.reason }));
+        return;
+      }
+
+      const tokenHash = crypto.createHash('sha256').update(tokenId).digest('hex');
+      revokeAccessTokenStmt.run(tokenId, tokenHash, documentId);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, message: 'Access token has been revoked successfully.' }));
       return;
@@ -1081,9 +1314,11 @@ export function createServer(options = {}) {
         return;
       }
 
-      if (record.owner_wallet && record.owner_wallet.toLowerCase() !== callerWallet) {
+      const auth = await checkDocumentSharingAuthorization(record, callerWallet, db);
+      const isOwnerOrAdminShare = auth.authorized;
+      if (!isOwnerOrAdminShare) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'Access Denied: Only the registered owner can share this document.' }));
+        res.end(JSON.stringify({ success: false, error: auth.reason }));
         return;
       }
 
@@ -1286,9 +1521,16 @@ export function createServer(options = {}) {
       }
 
       const record = getDocStmt.get(documentId);
-      if (!record || (record.owner_wallet && record.owner_wallet.toLowerCase() !== callerWallet)) {
+      if (!record) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: `Document ID "${documentId}" not found in storage.` }));
+        return;
+      }
+
+      const auth = await checkDocumentSharingAuthorization(record, callerWallet, db);
+      if (!auth.authorized) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'Access Denied: Only the document owner can view shares.' }));
+        res.end(JSON.stringify({ success: false, error: auth.reason }));
         return;
       }
 
@@ -1312,9 +1554,16 @@ export function createServer(options = {}) {
       }
 
       const record = getDocStmt.get(documentId);
-      if (!record || (record.owner_wallet && record.owner_wallet.toLowerCase() !== callerWallet)) {
+      if (!record) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: `Document ID "${documentId}" not found in storage.` }));
+        return;
+      }
+
+      const auth = await checkDocumentSharingAuthorization(record, callerWallet, db);
+      if (!auth.authorized) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'Access Denied: Only the document owner can revoke shares.' }));
+        res.end(JSON.stringify({ success: false, error: auth.reason }));
         return;
       }
 
@@ -1380,15 +1629,16 @@ export function createServer(options = {}) {
         }
       }
 
-      // Method 2: Check private access token in query param or header
+      // Method 2: Check private access token in header or query param (prefer header to avoid bearer tokens in logs/URLs)
       if (!isAuthorized) {
-        const queryToken = parsedUrl.searchParams.get('access_token') || parsedUrl.searchParams.get('token') || req.headers['x-access-token'];
-        if (queryToken && typeof queryToken === 'string') {
-          const cleanToken = queryToken.trim();
-          let tokenRecord = getAccessTokenStmt.get(cleanToken);
+        const tokenCandidate = req.headers['x-access-token'] || parsedUrl.searchParams.get('access_token') || parsedUrl.searchParams.get('token');
+        if (tokenCandidate && typeof tokenCandidate === 'string') {
+          const cleanToken = tokenCandidate.trim();
+          // Cryptographic hash lookup first so server does not need plaintext token storage
+          const tokenHash = crypto.createHash('sha256').update(cleanToken).digest('hex');
+          let tokenRecord = getAccessTokenByHashStmt.get(tokenHash);
           if (!tokenRecord) {
-            const tokenHash = crypto.createHash('sha256').update(cleanToken).digest('hex');
-            tokenRecord = getAccessTokenByHashStmt.get(tokenHash);
+            tokenRecord = getAccessTokenStmt.get(cleanToken);
           }
           if (tokenRecord) {
             if (tokenRecord.document_id !== documentId) {
@@ -1564,6 +1814,37 @@ export function createServer(options = {}) {
           content: fileBytes,
         };
 
+        let permanentAccessToken = null;
+        let permanentAccessUrl = null;
+
+        if (effectiveEmail && effectiveConsent) {
+          // Requirement 2: The access link must have NO EXPIRATION DATE (expires_at is null).
+          // Requirement 6: Store only a cryptographic hash of the access token on the server.
+          // Requirement 8: Send the link only to the owner email explicitly supplied and consented to.
+          const secretToken = 'pat_' + crypto.randomBytes(32).toString('hex');
+          const tokenHash = crypto.createHash('sha256').update(secretToken).digest('hex');
+          const tokenId = 'pat_id_' + crypto.randomBytes(16).toString('hex');
+          const nowIso = new Date().toISOString();
+
+          insertAccessTokenStmt.run(
+            tokenId,
+            documentId,
+            record.owner_wallet || 'system_registration',
+            nowIso,
+            null, // expires_at = null -> Non-expiring permanent token
+            'Owner Permanent Access Link',
+            tokenHash,
+            effectiveEmail.trim(),
+            effectiveMobile ? effectiveMobile.trim() : null,
+            'permanent'
+          );
+
+          permanentAccessToken = secretToken;
+          const appBaseUrl = req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`;
+          // Requirement 6: Do not put bearer tokens in URL query parameters; use client-side hash fragment #access_token=...
+          permanentAccessUrl = `${appBaseUrl}/verify/${encodeURIComponent(documentId)}#access_token=${encodeURIComponent(secretToken)}`;
+        }
+
         const dispatchResult = await dispatchOwnerNotifications({
           documentId,
           title: title || record?.file_name || 'Registered Document',
@@ -1579,6 +1860,7 @@ export function createServer(options = {}) {
           networkName,
           attachment,
           appBaseUrl: req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`,
+          secureAccessUrl: permanentAccessUrl,
         });
 
         // Update database with real notification delivery state
@@ -1597,6 +1879,7 @@ export function createServer(options = {}) {
           success: true,
           documentId,
           txHash,
+          permanentAccessUrl,
           notifications: dispatchResult,
         }));
       } catch (err) {
@@ -1623,6 +1906,20 @@ export function createServer(options = {}) {
 
       const record = getDocStmt.get(documentId);
       if (record) {
+        const caller = getAuthenticatedWallet(req) || (req.headers['x-wallet-address'] ? req.headers['x-wallet-address'].trim().toLowerCase() : null);
+        const superAuthor = getSuperAuthorAddress();
+        const isSuper = caller && caller.toLowerCase() === superAuthor.toLowerCase();
+        const isOwner = caller && record.owner_wallet && caller.toLowerCase() === record.owner_wallet.toLowerCase();
+
+        if (caller && !isSuper && !isOwner) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            error: 'Super Author access required: Only the document owner or root Super Author can delete this document.',
+          }));
+          return;
+        }
+
         const filePath = path.resolve(uploadsDir, record.stored_path);
         if (filePath.startsWith(uploadsDir) && fs.existsSync(filePath)) {
           try { fs.unlinkSync(filePath); } catch {}
@@ -1632,6 +1929,112 @@ export function createServer(options = {}) {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, message: `Document "${documentId}" removed from local storage.` }));
+      return;
+    }
+
+    // ----------------------------------------------------
+    // 8b. Clear Stored Data / Cache: POST /api/admin/clear-storage (Strictly Super Author Only)
+    // ----------------------------------------------------
+    if ((req.method === 'POST' && pathname === '/api/admin/clear-storage') || (req.method === 'DELETE' && pathname === '/api/storage/clear')) {
+      const callerWallet = getAuthenticatedWallet(req) || (req.headers['x-wallet-address'] ? req.headers['x-wallet-address'].trim().toLowerCase() : null);
+      const superAuthorAddr = getSuperAuthorAddress();
+
+      if (!callerWallet || callerWallet.toLowerCase() !== superAuthorAddr.toLowerCase()) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: false,
+          error: 'Super Author access required: Only the root Super Author can clear stored data.',
+        }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        message: 'Storage cache cleared by Super Author. On-chain blockchain records remain immutable.',
+      }));
+      return;
+    }
+
+    // ----------------------------------------------------
+    // 8c. Save Verified Mainnet Deployment Record: POST /api/deployment/record
+    // (Strictly Super Author Only, validates address and txHash, preserves testnet config)
+    // ----------------------------------------------------
+    if (req.method === 'POST' && pathname === '/api/deployment/record') {
+      const callerWallet = getAuthenticatedWallet(req) || (req.headers['x-wallet-address'] ? req.headers['x-wallet-address'].trim().toLowerCase() : null);
+      const superAuthorAddr = getSuperAuthorAddress();
+
+      if (!callerWallet || callerWallet.toLowerCase() !== superAuthorAddr.toLowerCase()) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: false,
+          error: 'Super Author access required: Only the root Super Author can record contract deployments.',
+        }));
+        return;
+      }
+
+      try {
+        const body = await readJsonBody(req);
+        const { networkKey, contractAddress, txHash, blockNumber, deployerAddress } = body;
+
+        if (networkKey !== 'mainnet') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Only Mainnet deployment records can be recorded via this endpoint.' }));
+          return;
+        }
+
+        if (!contractAddress || !/^0x[0-9a-fA-F]{40}$/.test(contractAddress)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Valid 20-byte contract address (0x...) is required.' }));
+          return;
+        }
+
+        if (!txHash || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Valid 32-byte transaction hash (0x...) is required.' }));
+          return;
+        }
+
+        const deploymentPath = path.resolve(__dirname, '../src/contracts/deployment.json');
+        if (fs.existsSync(deploymentPath)) {
+          const raw = fs.readFileSync(deploymentPath, 'utf8');
+          const data = JSON.parse(raw);
+
+          // Backup before saving
+          const backupPath = path.resolve(__dirname, `../src/contracts/deployment.backup.mainnet.${Date.now()}.json`);
+          fs.writeFileSync(backupPath, raw, 'utf8');
+
+          data.mainnet = {
+            network: 'MST Chain Mainnet',
+            chainId: '0x1226',
+            chainIdDecimal: 4646,
+            rpcUrl: 'https://mariorpc.mstblockchain.com',
+            blockExplorerUrl: 'https://mstscan.com',
+            nativeCurrency: { name: 'MSTC', symbol: 'MSTC', decimals: 18 },
+            contractAddress: contractAddress.trim(),
+            deploymentTxHash: txHash.trim(),
+            deployedAtBlock: blockNumber ? Number(blockNumber) : null,
+            deployerAddress: deployerAddress || callerWallet,
+            deployed: true,
+            deployedAt: new Date().toISOString(),
+            previousContractAddress: data.mainnet?.contractAddress || '',
+            historicalDeployments: data.mainnet?.historicalDeployments || [],
+          };
+
+          fs.writeFileSync(deploymentPath, JSON.stringify(data, null, 2), 'utf8');
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          message: 'Mainnet deployment record persistently saved and verified.',
+          contractAddress: contractAddress.trim(),
+          txHash: txHash.trim(),
+        }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: err.message }));
+      }
       return;
     }
 

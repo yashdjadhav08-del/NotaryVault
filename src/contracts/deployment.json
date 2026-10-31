@@ -32,21 +32,30 @@
     "network": "MST Chain Mainnet",
     "chainId": "0x1226",
     "chainIdDecimal": 4646,
-    "rpcUrl": "https://4646.rpc.thirdweb.com",
+    "rpcUrl": "https://mariorpc.mstblockchain.com",
     "blockExplorerUrl": "https://mstscan.com",
     "nativeCurrency": {
       "name": "MSTC",
       "symbol": "MSTC",
       "decimals": 18
     },
-    "contractAddress": "",
-    "deploymentTxHash": "",
-    "deployedAtBlock": null,
-    "deployerAddress": "",
-    "deployed": false,
-    "deployedAt": null,
-    "previousContractAddress": "",
-    "historicalDeployments": []
+    "contractAddress": "0xE25AD72aF5A6561602fF7A6038AD9E5b591c669e",
+    "deploymentTxHash": "0x49ef39c1b620b935037a6e8541b63bed170c7fc0563a10ba43b8a1cda751304d",
+    "deployedAtBlock": 21789582,
+    "deployerAddress": "0x6D9618b1Ee522d22f3C168B40A33466A89af00C4",
+    "deployed": true,
+    "deployedAt": "2026-10-29T10:00:00.000Z",
+    "previousContractAddress": "0xe9097672C2556318f1BD974323174baA43b88514",
+    "historicalDeployments": [
+      {
+        "version": "v1",
+        "contractAddress": "0xe9097672C2556318f1BD974323174baA43b88514",
+        "deploymentTxHash": "0x3148be636c550e69b70c94111f84aa965f42775ca40aeb92cf2999367eb4d505",
+        "deployedAtBlock": 21789102,
+        "deployerAddress": "0x6D9618b1Ee522d22f3C168B40A33466A89af00C4",
+        "deployedAt": "2026-10-29T09:00:00.000Z"
+      }
+    ]
   },
   "network": "MST Chain Testnet",
   "chainId": "0x5752035",

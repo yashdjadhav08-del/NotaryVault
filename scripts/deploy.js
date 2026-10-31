@@ -22,7 +22,7 @@ export const NETWORK_CONFIGS = {
     name: 'MST Chain Mainnet',
     expectedChainId: 4646,
     expectedChainIdHex: '0x1226',
-    defaultRpcUrl: 'https://4646.rpc.thirdweb.com',
+    defaultRpcUrl: 'https://mariorpc.mstblockchain.com',
     explorerBaseUrl: 'https://mstscan.com',
     currency: { name: 'MSTC', symbol: 'MSTC', decimals: 18 },
   },

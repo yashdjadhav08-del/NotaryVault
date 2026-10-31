@@ -3,7 +3,7 @@ import deploymentData from '../contracts/deployment.json';
 import contractArtifact from '../contracts/NotaryVaultRegistry.json';
 import { hashToBytes32, bytes32ToHash } from '../lib/hash';
 import { normalizeDocumentId } from '../lib/id';
-import type { DocumentType, DocumentRecord, ActivityEvent } from '../types';
+import type { DocumentType, DocumentRecord, ActivityEvent, AuthorApplication } from '../types';
 
 export type MSTNetworkKey = 'testnet' | 'mainnet';
 
@@ -93,7 +93,7 @@ export const MST_NETWORKS: Record<MSTNetworkKey, MSTNetworkDefinition> = {
     name: 'MST Chain Mainnet',
     chainIdHex: '0x1226', // 4646 in hex is 0x1226
     chainIdDecimal: 4646,
-    rpcUrl: deploymentConfig.mainnet?.rpcUrl || 'https://4646.rpc.thirdweb.com',
+    rpcUrl: deploymentConfig.mainnet?.rpcUrl || 'https://mariorpc.mstblockchain.com',
     explorerBaseUrl: deploymentConfig.mainnet?.blockExplorerUrl || 'https://mstscan.com',
     currency: {
       name: 'MSTC',
@@ -193,29 +193,67 @@ export interface OnChainRevocationResult {
   txHash?: string;
   blockNumber?: number;
   networkKey?: MSTNetworkKey;
+  chainId?: string | number;
+  contractAddress?: string;
   error?: string;
+}
+
+const TESTNET_KNOWN_ADDRESSES = [
+  '0xc4b7ea1b1ce4e95bad65bf3fd3c7a079720120f3',
+  '0xe9097672c2556318f1bd974323174baa43b88514'
+];
+
+export function isTestnetContractAddress(addr?: string | null): boolean {
+  if (!addr) return false;
+  return TESTNET_KNOWN_ADDRESSES.includes(addr.trim().toLowerCase());
 }
 
 export interface DocumentIdCheckResult {
   exists: boolean;
   docId: string;
-  source?: 'active_contract' | 'historical_contract';
+  source?: 'active_contract' | 'historical_contract' | 'unconfigured';
   contractAddress?: string;
   registrant?: string;
   registeredAt?: number;
   isRevoked?: boolean;
+  isContractDeployed?: boolean;
+  unverifiedOnChain?: boolean;
   error?: string;
 }
 
 /**
  * Returns the deployed contract address for a given network, or empty string if not deployed.
+ * Strictly guarantees that Testnet contract addresses are never used for Mainnet.
  */
 export function getContractAddressForNetwork(networkKey: MSTNetworkKey = 'testnet'): string {
-  // Allow environment variable override for Mainnet and Testnet
+  // 1. Allow runtime / localStorage override (e.g. after in-app deployment)
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const stored = window.localStorage.getItem(`notaryvault_${networkKey}_contract_address`);
+      if (stored && ethers.isAddress(stored.trim())) {
+        const trimmed = stored.trim();
+        // Guard: Never allow Testnet address to be used on Mainnet
+        if (networkKey === 'mainnet' && isTestnetContractAddress(trimmed)) {
+          console.warn('[NotaryVault:Security] Blocked attempt to use Testnet contract address for Mainnet:', trimmed);
+        } else {
+          return trimmed;
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Allow environment variable override for Mainnet and Testnet
   if (typeof process !== 'undefined' && process.env) {
     if (networkKey === 'mainnet') {
       const envMainnet = process.env.VITE_MAINNET_CONTRACT_ADDRESS || process.env.MAINNET_CONTRACT_ADDRESS;
-      if (envMainnet && ethers.isAddress(envMainnet.trim())) return envMainnet.trim();
+      if (envMainnet && ethers.isAddress(envMainnet.trim())) {
+        const trimmed = envMainnet.trim();
+        if (isTestnetContractAddress(trimmed)) {
+          console.warn('[NotaryVault:Security] Blocked Testnet address in Mainnet env variable:', trimmed);
+        } else {
+          return trimmed;
+        }
+      }
     } else {
       const envTestnet = process.env.VITE_TESTNET_CONTRACT_ADDRESS || process.env.TESTNET_CONTRACT_ADDRESS;
       if (envTestnet && ethers.isAddress(envTestnet.trim())) return envTestnet.trim();
@@ -224,7 +262,14 @@ export function getContractAddressForNetwork(networkKey: MSTNetworkKey = 'testne
   if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
     if (networkKey === 'mainnet') {
       const envMainnet = (import.meta as any).env.VITE_MAINNET_CONTRACT_ADDRESS;
-      if (envMainnet && ethers.isAddress(envMainnet.trim())) return envMainnet.trim();
+      if (envMainnet && ethers.isAddress(envMainnet.trim())) {
+        const trimmed = envMainnet.trim();
+        if (isTestnetContractAddress(trimmed)) {
+          console.warn('[NotaryVault:Security] Blocked Testnet address in Mainnet import.meta.env:', trimmed);
+        } else {
+          return trimmed;
+        }
+      }
     } else {
       const envTestnet = (import.meta as any).env.VITE_TESTNET_CONTRACT_ADDRESS;
       if (envTestnet && ethers.isAddress(envTestnet.trim())) return envTestnet.trim();
@@ -233,7 +278,12 @@ export function getContractAddressForNetwork(networkKey: MSTNetworkKey = 'testne
 
   const networkSection = deploymentConfig[networkKey];
   if (networkSection && networkSection.contractAddress && ethers.isAddress(networkSection.contractAddress)) {
-    return networkSection.contractAddress.trim();
+    const trimmed = networkSection.contractAddress.trim();
+    if (networkKey === 'mainnet' && isTestnetContractAddress(trimmed)) {
+      console.warn('[NotaryVault:Security] Blocked Testnet address in Mainnet section of deploymentConfig:', trimmed);
+    } else {
+      return trimmed;
+    }
   }
   // Fallback to top-level if checking testnet
   if (networkKey === 'testnet' && deploymentConfig.contractAddress && ethers.isAddress(deploymentConfig.contractAddress)) {
@@ -345,12 +395,20 @@ export function getHistoricalContractAddresses(networkKey: MSTNetworkKey = 'test
   const addresses: string[] = [];
   const networkSection = deploymentConfig[networkKey];
   if (networkSection?.previousContractAddress && ethers.isAddress(networkSection.previousContractAddress)) {
-    addresses.push(networkSection.previousContractAddress.trim());
+    const addr = networkSection.previousContractAddress.trim();
+    if (networkKey !== 'mainnet' || !isTestnetContractAddress(addr)) {
+      addresses.push(addr);
+    }
   }
   if (Array.isArray(networkSection?.historicalDeployments)) {
     for (const h of networkSection.historicalDeployments) {
-      if (h.contractAddress && ethers.isAddress(h.contractAddress) && !addresses.includes(h.contractAddress.trim())) {
-        addresses.push(h.contractAddress.trim());
+      if (h.contractAddress && ethers.isAddress(h.contractAddress)) {
+        const addr = h.contractAddress.trim();
+        if (networkKey !== 'mainnet' || !isTestnetContractAddress(addr)) {
+          if (!addresses.includes(addr)) {
+            addresses.push(addr);
+          }
+        }
       }
     }
   }
@@ -431,7 +489,7 @@ export function isChainIdMatchingNetwork(chainId: string | number | bigint, netw
 export async function getSignerContract(
   rawProvider: any,
   networkKey: MSTNetworkKey = 'testnet'
-): Promise<{ contract: ethers.Contract; signer: ethers.Signer; chainId: string; networkKey: MSTNetworkKey }> {
+): Promise<{ contract: ethers.Contract; signer: ethers.Signer; chainId: string; contractAddress: string; networkKey: MSTNetworkKey }> {
   if (!rawProvider) {
     throw new Error('No wallet provider detected. Please connect your BridgeKey wallet.');
   }
@@ -451,7 +509,7 @@ export async function getSignerContract(
   if (!contractAddress || !ethers.isAddress(contractAddress)) {
     if (networkKey === 'mainnet') {
       throw new Error(
-        'Smart contract has not been deployed to MST Chain Mainnet yet. Run `npm run deploy:mst:mainnet` to deploy.'
+        'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED: Smart contract has not been deployed or configured on MST Chain Mainnet (Chain ID: 4646 / 0x1226). Transactions cannot be sent.'
       );
     }
     throw new Error(
@@ -461,7 +519,7 @@ export async function getSignerContract(
 
   const signer = await browserProvider.getSigner();
   const contract = new ethers.Contract(contractAddress, contractArtifact.abi, signer);
-  return { contract, signer, chainId: currentChainIdHex, networkKey };
+  return { contract, signer, chainId: currentChainIdHex, contractAddress, networkKey };
 }
 
 /**
@@ -706,8 +764,11 @@ export async function registerOnChain(
     console.info(`[registerOnChain] Sending registerDocument tx for "${cleanId}" on ${networkKey} from ${registrantAddress}`);
     const tx = await contract.registerDocument(cleanId, bytes32Hash, typeIndex);
 
-    // 7. Await mining receipt
+    // 7. Await mining receipt & verify success status
     const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
 
     return {
       success: true,
@@ -927,15 +988,21 @@ export async function revokeOnChain(
 ): Promise<OnChainRevocationResult> {
   try {
     const cleanId = normalizeDocumentId(docId);
-    const { contract } = await getSignerContract(rawProvider, networkKey);
+    const { contract, chainId, contractAddress } = await getSignerContract(rawProvider, networkKey);
     const tx = await contract.revokeDocument(cleanId, reason || 'Revoked by registrant');
     const receipt = await tx.wait();
+
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
 
     return {
       success: true,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
       networkKey,
+      chainId,
+      contractAddress,
     };
   } catch (err: any) {
     return {
@@ -977,13 +1044,84 @@ export async function getOnChainIdByHash(
 }
 
 /**
+ * Wraps a promise with an explicit timeout to prevent RPC requests from hanging indefinitely.
+ */
+export async function withRpcTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number = 4000,
+  timeoutMessage: string = 'RPC request timed out'
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${timeoutMessage} (${timeoutMs}ms limit exceeded)`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export interface RpcConnectivityResult {
+  networkKey: MSTNetworkKey;
+  rpcUrl: string;
+  isReachable: boolean;
+  chainIdDecimal?: number;
+  blockNumber?: number;
+  latencyMs?: number;
+  error?: string;
+}
+
+/**
+ * Tests RPC connectivity to the network's configured endpoint with bounded timeout and diagnostic details.
+ */
+export async function checkRpcConnectivity(
+  networkKey: MSTNetworkKey = 'mainnet',
+  timeoutMs = 4000
+): Promise<RpcConnectivityResult> {
+  const networkDef = MST_NETWORKS[networkKey] || MST_NETWORKS.mainnet;
+  const start = Date.now();
+  try {
+    const provider = new ethers.JsonRpcProvider(networkDef.rpcUrl);
+    const [network, blockNumber] = await withRpcTimeout(
+      Promise.all([provider.getNetwork(), provider.getBlockNumber()]),
+      timeoutMs,
+      `RPC connectivity check to ${networkDef.rpcUrl} timed out`
+    );
+    const latencyMs = Date.now() - start;
+    return {
+      networkKey,
+      rpcUrl: networkDef.rpcUrl,
+      isReachable: true,
+      chainIdDecimal: Number(network.chainId),
+      blockNumber,
+      latencyMs,
+    };
+  } catch (err: any) {
+    const latencyMs = Date.now() - start;
+    return {
+      networkKey,
+      rpcUrl: networkDef.rpcUrl,
+      isReachable: false,
+      latencyMs,
+      error: err?.message || 'RPC connectivity test failed.',
+    };
+  }
+}
+
+/**
  * Checks whether a Document ID has already been registered across both the active
  * contract registry and historical deployments (e.g. v1 contract with NV-2026-566456).
  *
- * This provides a frontend / client-side preflight safeguard before submitting transactions.
- * Note: While the active v2 contract enforces uniqueness atomically on-chain for its own records,
- * cross-contract uniqueness against historical deployments relies on this preflight verification
- * because v2 cannot directly query v1 bytecode on-chain.
+ * Optimizations & Guards:
+ * 1. Checks whether smart contract is deployed/configured on networkKey. If not, returns immediately
+ *    without making unnecessary/failing RPC calls.
+ * 2. Strictly forbids using Testnet contract addresses on Mainnet.
+ * 3. Concurrently queries active and historical contracts using Promise.all with bounded timeouts.
+ * 4. Never falsely claims an ID is unique if an RPC call fails.
  */
 export async function checkDocumentIdExists(
   docId: string,
@@ -994,67 +1132,134 @@ export async function checkDocumentIdExists(
     return { exists: false, docId: '' };
   }
 
-  let activeCheckSucceeded = false;
-  let activeCheckError: string | undefined;
+  // 1. Guard: Check if contract is deployed/configured on this network
+  if (!isContractConfigured(networkKey)) {
+    return {
+      exists: false,
+      docId: cleanId,
+      source: 'unconfigured',
+      isContractDeployed: false,
+      unverifiedOnChain: true,
+      error: networkKey === 'mainnet'
+        ? 'Mainnet smart contract is not yet deployed or configured (Chain ID 4646). On-chain uniqueness verification is unavailable.'
+        : `Smart contract is not configured on ${networkKey}.`,
+    };
+  }
 
-  // 1. Check active deployed contract
+  // 2. Guard: Never allow Testnet contract address to be used on Mainnet
+  const activeAddress = getContractAddressForNetwork(networkKey);
+  if (networkKey === 'mainnet' && isTestnetContractAddress(activeAddress)) {
+    console.warn('[NotaryVault:Security] Blocked attempt to query Testnet contract address on Mainnet.');
+    return {
+      exists: false,
+      docId: cleanId,
+      isContractDeployed: false,
+      unverifiedOnChain: true,
+      error: 'Security violation: Testnet contract address cannot be used for Mainnet verification.',
+    };
+  }
+
+  // 3. Concurrent checks with bounded timeouts across active and historical deployments
+  const checkPromises: Promise<{
+    source: 'active_contract' | 'historical_contract';
+    address: string;
+    exists: boolean;
+    registrant?: string;
+    registeredAt?: number;
+    isRevoked?: boolean;
+    error?: string;
+  }>[] = [];
+
+  // Active deployed contract
   const contract = getReadOnlyContract(networkKey);
   if (contract) {
-    try {
-      const res = await contract.verifyDocument(cleanId, ethers.ZeroHash);
-      activeCheckSucceeded = true;
-      if (res && res[1]) {
-        return {
-          exists: true,
-          docId: cleanId,
-          source: 'active_contract',
-          contractAddress: await contract.getAddress(),
-          registrant: res[2] !== ethers.ZeroAddress ? res[2] : undefined,
-          registeredAt: Number(res[3]) > 0 ? Number(res[3]) : undefined,
-          isRevoked: Boolean(res[4]),
-        };
-      }
-    } catch (err: any) {
-      // RPC failure — do NOT treat as "ID is available"
-      activeCheckError = err?.message || 'RPC call failed for active contract lookup.';
-    }
+    checkPromises.push(
+      withRpcTimeout(
+        contract.verifyDocument(cleanId, ethers.ZeroHash),
+        4000,
+        `Active contract query on ${networkKey} timed out`
+      ).then(res => ({
+        source: 'active_contract' as const,
+        address: activeAddress,
+        exists: Boolean(res && res[1]),
+        registrant: res && res[2] !== ethers.ZeroAddress ? res[2] : undefined,
+        registeredAt: res && Number(res[3]) > 0 ? Number(res[3]) : undefined,
+        isRevoked: Boolean(res[4]),
+      })).catch(err => ({
+        source: 'active_contract' as const,
+        address: activeAddress,
+        exists: false,
+        error: err?.message || 'Active contract RPC call failed.',
+      }))
+    );
   }
 
-  // 2. Check historical deployments (e.g. historical contract 0xe9097672C2556318f1BD974323174baA43b88514)
-  let historicalCheckSucceeded = false;
-  let historicalCheckError: string | undefined;
+  // Historical deployments (if any)
   const historicalAddresses = getHistoricalContractAddresses(networkKey);
   for (const histAddr of historicalAddresses) {
+    if (histAddr.toLowerCase() === activeAddress.toLowerCase()) continue;
+    // Security guard: Never check Testnet historical addresses on Mainnet
+    if (networkKey === 'mainnet' && isTestnetContractAddress(histAddr)) continue;
+
     const histContract = getReadOnlyContractForAddress(histAddr, networkKey);
     if (histContract) {
-      try {
-        const histRes = await histContract.verifyDocument(cleanId, ethers.ZeroHash);
-        historicalCheckSucceeded = true;
-        if (histRes && histRes[1]) {
-          return {
-            exists: true,
-            docId: cleanId,
-            source: 'historical_contract',
-            contractAddress: histAddr,
-            registrant: histRes[2] !== ethers.ZeroAddress ? histRes[2] : undefined,
-            registeredAt: Number(histRes[3]) > 0 ? Number(histRes[3]) : undefined,
-            isRevoked: Boolean(histRes[4]),
-          };
-        }
-      } catch (err: any) {
-        historicalCheckError = err?.message || 'RPC call failed for historical contract lookup.';
-      }
+      checkPromises.push(
+        withRpcTimeout(
+          histContract.verifyDocument(cleanId, ethers.ZeroHash),
+          4000,
+          `Historical contract (${histAddr.slice(0, 8)}...) query on ${networkKey} timed out`
+        ).then(histRes => ({
+          source: 'historical_contract' as const,
+          address: histAddr,
+          exists: Boolean(histRes && histRes[1]),
+          registrant: histRes && histRes[2] !== ethers.ZeroAddress ? histRes[2] : undefined,
+          registeredAt: histRes && Number(histRes[3]) > 0 ? Number(histRes[3]) : undefined,
+          isRevoked: Boolean(histRes[4]),
+        })).catch(err => ({
+          source: 'historical_contract' as const,
+          address: histAddr,
+          exists: false,
+          error: err?.message || 'Historical contract RPC call failed.',
+        }))
+      );
     }
   }
 
-  // 3. If contract is configured on this network, but neither active nor historical checks succeeded, report the error
-  //    so callers know this is "unknown" rather than "confirmed available".
-  if (isContractConfigured(networkKey) && !activeCheckSucceeded && (historicalAddresses.length === 0 || !historicalCheckSucceeded)) {
-    const combinedError = activeCheckError || historicalCheckError || 'Could not reach on-chain registry to verify Document ID uniqueness.';
-    return { exists: false, docId: cleanId, error: combinedError };
+  // Await all checks concurrently
+  const results = await Promise.all(checkPromises);
+
+  // Check if any contract reported existing document
+  const found = results.find(r => r.exists);
+  if (found) {
+    return {
+      exists: true,
+      docId: cleanId,
+      source: found.source,
+      contractAddress: found.address,
+      registrant: found.registrant,
+      registeredAt: found.registeredAt,
+      isRevoked: found.isRevoked,
+      isContractDeployed: true,
+    };
   }
 
-  return { exists: false, docId: cleanId };
+  // Check if any check failed with RPC error
+  const failed = results.find(r => r.error);
+  if (failed) {
+    return {
+      exists: false,
+      docId: cleanId,
+      error: failed.error,
+      isContractDeployed: true,
+      unverifiedOnChain: true,
+    };
+  }
+
+  return {
+    exists: false,
+    docId: cleanId,
+    isContractDeployed: true,
+  };
 }
 
 /**
@@ -1117,13 +1322,13 @@ export async function authorizeAuthorOnChain(
   authorAddress: string,
   rawProvider: any,
   networkKey: MSTNetworkKey = 'testnet'
-): Promise<{ success: boolean; txHash?: string; blockNumber?: number; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; blockNumber?: number; contractAddress?: string; chainId?: string; networkKey?: MSTNetworkKey; error?: string }> {
   try {
     if (!authorAddress || !ethers.isAddress(authorAddress)) {
       throw new Error('Invalid author wallet address.');
     }
 
-    const { contract } = await getSignerContract(rawProvider, networkKey);
+    const { contract, chainId } = await getSignerContract(rawProvider, networkKey);
     if (typeof contract.authorizeAuthor !== 'function') {
       throw new Error('Deployed smart contract does not support authorizeAuthor in its current version.');
     }
@@ -1131,14 +1336,22 @@ export async function authorizeAuthorOnChain(
     const tx = await contract.authorizeAuthor(authorAddress);
     const receipt = await tx.wait();
 
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
+
     return {
       success: true,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
+      contractAddress: await contract.getAddress(),
+      chainId,
+      networkKey,
     };
   } catch (err: any) {
     return {
       success: false,
+      networkKey,
       error: parseContractError(err),
     };
   }
@@ -1151,13 +1364,13 @@ export async function deauthorizeAuthorOnChain(
   authorAddress: string,
   rawProvider: any,
   networkKey: MSTNetworkKey = 'testnet'
-): Promise<{ success: boolean; txHash?: string; blockNumber?: number; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; blockNumber?: number; contractAddress?: string; chainId?: string; networkKey?: MSTNetworkKey; error?: string }> {
   try {
     if (!authorAddress || !ethers.isAddress(authorAddress)) {
       throw new Error('Invalid author wallet address.');
     }
 
-    const { contract } = await getSignerContract(rawProvider, networkKey);
+    const { contract, chainId } = await getSignerContract(rawProvider, networkKey);
     if (typeof contract.deauthorizeAuthor !== 'function') {
       throw new Error('Deployed smart contract does not support deauthorizeAuthor in its current version.');
     }
@@ -1165,14 +1378,68 @@ export async function deauthorizeAuthorOnChain(
     const tx = await contract.deauthorizeAuthor(authorAddress);
     const receipt = await tx.wait();
 
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
+
     return {
       success: true,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
+      contractAddress: await contract.getAddress(),
+      chainId,
+      networkKey,
     };
   } catch (err: any) {
     return {
       success: false,
+      networkKey,
+      error: parseContractError(err),
+    };
+  }
+}
+
+/**
+ * Records an immutable document audit event on-chain. Super Author or Secondary Author.
+ */
+export async function recordAuditEventOnChain(
+  docId: string,
+  eventType: string,
+  remarks: string,
+  rawProvider: any,
+  networkKey: MSTNetworkKey = 'testnet'
+): Promise<{ success: boolean; txHash?: string; blockNumber?: number; contractAddress?: string; chainId?: string; networkKey?: MSTNetworkKey; error?: string }> {
+  try {
+    const cleanId = normalizeDocumentId(docId);
+    if (!cleanId) {
+      throw new Error('Document ID cannot be empty.');
+    }
+
+    const { contract, chainId } = await getSignerContract(rawProvider, networkKey);
+    if (typeof contract.recordAuditEvent !== 'function') {
+      throw new Error('Deployed smart contract does not support recordAuditEvent in its current version.');
+    }
+
+    const eventTypeBytes32 = ethers.encodeBytes32String(eventType.slice(0, 31));
+    const tx = await contract.recordAuditEvent(cleanId, eventTypeBytes32, remarks || '');
+    const receipt = await tx.wait();
+
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
+
+    return {
+      success: true,
+      txHash: receipt.hash,
+      blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
+      contractAddress: await contract.getAddress(),
+      chainId,
+      networkKey,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      networkKey,
       error: parseContractError(err),
     };
   }
@@ -1189,9 +1456,9 @@ export async function submitAuthorApplicationOnChain(
   justification: string,
   rawProvider: any,
   networkKey: MSTNetworkKey = 'testnet'
-): Promise<{ success: boolean; txHash?: string; blockNumber?: number; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; blockNumber?: number; contractAddress?: string; chainId?: string; networkKey?: MSTNetworkKey; error?: string }> {
   try {
-    const { contract } = await getSignerContract(rawProvider, networkKey);
+    const { contract, chainId } = await getSignerContract(rawProvider, networkKey);
     if (typeof contract.submitAuthorApplication !== 'function') {
       throw new Error('Deployed smart contract does not support submitAuthorApplication in its current version.');
     }
@@ -1205,14 +1472,22 @@ export async function submitAuthorApplicationOnChain(
     );
     const receipt = await tx.wait();
 
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
+
     return {
       success: true,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
+      contractAddress: await contract.getAddress(),
+      chainId,
+      networkKey,
     };
   } catch (err: any) {
     return {
       success: false,
+      networkKey,
       error: parseContractError(err),
     };
   }
@@ -1227,13 +1502,13 @@ export async function reviewAuthorApplicationOnChain(
   reviewNotes: string,
   rawProvider: any,
   networkKey: MSTNetworkKey = 'testnet'
-): Promise<{ success: boolean; txHash?: string; blockNumber?: number; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; blockNumber?: number; contractAddress?: string; chainId?: string; networkKey?: MSTNetworkKey; error?: string }> {
   try {
     if (!applicantAddress || !ethers.isAddress(applicantAddress)) {
       throw new Error('Invalid applicant wallet address.');
     }
 
-    const { contract } = await getSignerContract(rawProvider, networkKey);
+    const { contract, chainId } = await getSignerContract(rawProvider, networkKey);
     if (typeof contract.reviewAuthorApplication !== 'function') {
       throw new Error('Deployed smart contract does not support reviewAuthorApplication in its current version.');
     }
@@ -1241,14 +1516,22 @@ export async function reviewAuthorApplicationOnChain(
     const tx = await contract.reviewAuthorApplication(applicantAddress, approve, reviewNotes || '');
     const receipt = await tx.wait();
 
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
+
     return {
       success: true,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
+      contractAddress: await contract.getAddress(),
+      chainId,
+      networkKey,
     };
   } catch (err: any) {
     return {
       success: false,
+      networkKey,
       error: parseContractError(err),
     };
   }
@@ -1295,6 +1578,11 @@ export async function getOnChainApplication(
   if (!contract || typeof contract.getApplication !== 'function') return null;
   try {
     const raw = await contract.getApplication(applicantAddress);
+    const appliedAtNum = raw[2] ? Number(raw[2]) : 0;
+    if (appliedAtNum === 0 && (!raw[0] || raw[0] === '')) {
+      return null;
+    }
+
     const statusCode = Number(raw[4]);
     const statusMap: Record<number, 'None' | 'Pending' | 'Approved' | 'Rejected'> = {
       0: 'None',
@@ -1304,19 +1592,142 @@ export async function getOnChainApplication(
     };
 
     return {
-      appId: raw[0],
-      applicant: raw[1],
-      appliedAt: raw[2] ? new Date(Number(raw[2]) * 1000).toISOString() : '',
-      reviewedAt: raw[3] ? new Date(Number(raw[3]) * 1000).toISOString() : '',
+      appId: raw[0] || '',
+      applicant: raw[1] || applicantAddress,
+      appliedAt: appliedAtNum ? new Date(appliedAtNum * 1000).toISOString() : '',
+      reviewedAt: raw[3] && Number(raw[3]) ? new Date(Number(raw[3]) * 1000).toISOString() : '',
       status: statusMap[statusCode] || 'None',
-      applicantName: raw[5],
-      organization: raw[6],
-      contactEmail: raw[7],
-      justification: raw[8],
-      reviewNotes: raw[9],
+      applicantName: raw[5] || '',
+      organization: raw[6] || '',
+      contactEmail: raw[7] || '',
+      justification: raw[8] || '',
+      reviewNotes: raw[9] || '',
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Fetches all on-chain author applications by querying ApplicationSubmitted and
+ * ApplicationReviewed events from the deployed block, fetching current application details.
+ */
+export async function fetchAllOnChainAuthorApplications(
+  networkKey: MSTNetworkKey = 'testnet'
+): Promise<{ success: boolean; applications: AuthorApplication[]; error?: string }> {
+  try {
+    const contract = getReadOnlyContract(networkKey);
+    if (!contract) {
+      return { success: false, applications: [], error: `Contract not configured for ${networkKey}.` };
+    }
+
+    const netDeploy = deploymentConfig[networkKey];
+    const fromBlock = (netDeploy && netDeploy.deployedAtBlock) ? netDeploy.deployedAtBlock : 0;
+
+    // Query ApplicationSubmitted and ApplicationReviewed events
+    const submitFilter = contract.filters.ApplicationSubmitted ? contract.filters.ApplicationSubmitted() : null;
+    const reviewFilter = contract.filters.ApplicationReviewed ? contract.filters.ApplicationReviewed() : null;
+
+    if (!submitFilter) {
+      return { success: true, applications: [] };
+    }
+
+    const [submitEvents, reviewEvents] = await Promise.all([
+      contract.queryFilter(submitFilter, fromBlock, 'latest').catch(() => []),
+      reviewFilter ? contract.queryFilter(reviewFilter, fromBlock, 'latest').catch(() => []) : Promise.resolve([])
+    ]);
+
+    // Map by applicant address (lowercase)
+    const applicantEventsMap = new Map<string, {
+      submissionTxHash: string;
+      submissionBlockNumber: number;
+      submittedAtTimestamp?: number;
+      approvalTxHash?: string;
+      approvalBlockNumber?: number;
+      reviewedBy?: string;
+    }>();
+
+    for (const ev of submitEvents) {
+      try {
+        const parsed = contract.interface.parseLog({ topics: ev.topics as string[], data: ev.data });
+        if (parsed) {
+          const applicant = (parsed.args.applicant || parsed.args[1] || '').toLowerCase();
+          if (applicant) {
+            applicantEventsMap.set(applicant, {
+              submissionTxHash: ev.transactionHash,
+              submissionBlockNumber: ev.blockNumber,
+              submittedAtTimestamp: parsed.args.timestamp ? Number(parsed.args.timestamp) : undefined,
+            });
+          }
+        }
+      } catch {
+        // Log parsing fallback
+      }
+    }
+
+    for (const ev of reviewEvents) {
+      try {
+        const parsed = contract.interface.parseLog({ topics: ev.topics as string[], data: ev.data });
+        if (parsed) {
+          const applicant = (parsed.args.applicant || parsed.args[1] || '').toLowerCase();
+          const existing = applicantEventsMap.get(applicant);
+          if (existing) {
+            existing.approvalTxHash = ev.transactionHash;
+            existing.approvalBlockNumber = ev.blockNumber;
+            existing.reviewedBy = parsed.args.reviewedBy || parsed.args[4];
+          } else {
+            applicantEventsMap.set(applicant, {
+              submissionTxHash: ev.transactionHash,
+              submissionBlockNumber: ev.blockNumber,
+              approvalTxHash: ev.transactionHash,
+              approvalBlockNumber: ev.blockNumber,
+              reviewedBy: parsed.args.reviewedBy || parsed.args[4],
+            });
+          }
+        }
+      } catch {
+        // Log parsing fallback
+      }
+    }
+
+    // Now for each applicant, fetch latest on-chain state
+    const apps: AuthorApplication[] = [];
+    for (const [applicantAddr, evData] of applicantEventsMap.entries()) {
+      const onChainData = await getOnChainApplication(applicantAddr, networkKey);
+      if (onChainData && onChainData.status !== 'None') {
+        apps.push({
+          id: onChainData.appId || `APP-${applicantAddr.slice(2, 8).toUpperCase()}`,
+          applicantWallet: ethers.getAddress(applicantAddr),
+          applicantName: onChainData.applicantName || 'Verified Applicant',
+          organization: onChainData.organization || 'Notary Applicant',
+          licenseNumber: 'Verified On-Chain',
+          contactEmail: onChainData.contactEmail || '',
+          justification: onChainData.justification || '',
+          submittedAt: onChainData.appliedAt || new Date().toISOString(),
+          status: onChainData.status as any,
+          reviewedAt: onChainData.reviewedAt || undefined,
+          reviewedBy: evData.reviewedBy || undefined,
+          reviewNotes: onChainData.reviewNotes || undefined,
+          submissionTxHash: evData.submissionTxHash,
+          submissionBlockNumber: evData.submissionBlockNumber,
+          approvalTxHash: evData.approvalTxHash,
+          approvalBlockNumber: evData.approvalBlockNumber,
+          networkKey,
+          isOnChain: true,
+        });
+      }
+    }
+
+    return {
+      success: true,
+      applications: apps,
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      applications: [],
+      error: parseContractError(err),
+    };
   }
 }
 
@@ -1327,13 +1738,13 @@ export async function transferSuperAuthorOnChain(
   newSuperAuthorAddress: string,
   rawProvider: any,
   networkKey: MSTNetworkKey = 'testnet'
-): Promise<{ success: boolean; txHash?: string; blockNumber?: number; error?: string }> {
+): Promise<{ success: boolean; txHash?: string; blockNumber?: number; contractAddress?: string; chainId?: string; networkKey?: MSTNetworkKey; error?: string }> {
   try {
     if (!newSuperAuthorAddress || !ethers.isAddress(newSuperAuthorAddress)) {
       throw new Error('Invalid new Super Author wallet address.');
     }
 
-    const { contract } = await getSignerContract(rawProvider, networkKey);
+    const { contract, chainId } = await getSignerContract(rawProvider, networkKey);
     if (typeof contract.transferSuperAuthor !== 'function') {
       throw new Error('Deployed smart contract does not support transferSuperAuthor in its current version.');
     }
@@ -1341,14 +1752,22 @@ export async function transferSuperAuthorOnChain(
     const tx = await contract.transferSuperAuthor(newSuperAuthorAddress);
     const receipt = await tx.wait();
 
+    if (!receipt || receipt.status !== 1) {
+      throw new Error('Transaction execution failed or was reverted on-chain.');
+    }
+
     return {
       success: true,
       txHash: receipt.hash,
       blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
+      contractAddress: await contract.getAddress(),
+      chainId,
+      networkKey,
     };
   } catch (err: any) {
     return {
       success: false,
+      networkKey,
       error: parseContractError(err),
     };
   }
@@ -1358,8 +1777,22 @@ export async function transferSuperAuthorOnChain(
  * Returns deployment metadata for a specific network or full configuration.
  */
 export function getDeploymentConfig(networkKey?: MSTNetworkKey) {
-  if (networkKey && deploymentConfig[networkKey]) {
-    return deploymentConfig[networkKey];
+  if (networkKey) {
+    const base = deploymentConfig[networkKey] || {};
+    if (typeof window !== 'undefined' && window.localStorage) {
+      try {
+        const storedJson = window.localStorage.getItem(`notaryvault_${networkKey}_deployment`);
+        if (storedJson) {
+          const parsed = JSON.parse(storedJson);
+          return { ...base, ...parsed };
+        }
+        const storedAddr = window.localStorage.getItem(`notaryvault_${networkKey}_contract_address`);
+        if (storedAddr && ethers.isAddress(storedAddr)) {
+          return { ...base, contractAddress: storedAddr, deployed: true };
+        }
+      } catch {}
+    }
+    return base;
   }
   return deploymentConfig;
 }
@@ -1501,6 +1934,7 @@ export async function recoverOnChainRecords(
           contractAddress: contractAddress,
           networkChainId: targetNet.chainIdHex,
           networkKey,
+          networkName: targetNet.name,
           registrantAddress: registrant,
           onChainStatus: isRevoked ? 'revoked' : 'registered',
         };
@@ -1515,6 +1949,13 @@ export async function recoverOnChainRecords(
           documentId: cleanDocId,
           timestamp: isoTimestamp,
           status: 'success',
+          txHash: log.transactionHash,
+          blockNumber: log.blockNumber ? Number(log.blockNumber) : undefined,
+          networkKey,
+          networkName: targetNet.name,
+          chainId: targetNet.chainIdHex,
+          contractAddress,
+          isOnChain: true,
         });
       } catch (itemErr) {
         console.warn('Error processing on-chain log entry:', itemErr);
@@ -1538,6 +1979,13 @@ export async function recoverOnChainRecords(
           documentId: docId,
           timestamp: isoTs,
           status: 'warning',
+          txHash: rLog.transactionHash,
+          blockNumber: rLog.blockNumber ? Number(rLog.blockNumber) : undefined,
+          networkKey,
+          networkName: targetNet.name,
+          chainId: targetNet.chainIdHex,
+          contractAddress,
+          isOnChain: true,
         });
       }
     }
@@ -1558,6 +2006,13 @@ export async function recoverOnChainRecords(
           documentId: docId,
           timestamp: isoTs,
           status: 'info',
+          txHash: aLog.transactionHash,
+          blockNumber: aLog.blockNumber ? Number(aLog.blockNumber) : undefined,
+          networkKey,
+          networkName: targetNet.name,
+          chainId: targetNet.chainIdHex,
+          contractAddress,
+          isOnChain: true,
         });
       }
     }
@@ -1578,3 +2033,293 @@ export async function recoverOnChainRecords(
     };
   }
 }
+
+/**
+ * Reads and verifies the current Super Author wallet address directly from the on-chain
+ * smart contract registry via JSON-RPC.
+ * Does not trust localStorage or client-side roles.
+ */
+export async function getOnChainSuperAuthor(networkKey?: MSTNetworkKey): Promise<string | null> {
+  const networksToCheck: MSTNetworkKey[] = networkKey ? [networkKey] : ['mainnet', 'testnet'];
+  for (const net of networksToCheck) {
+    try {
+      const netDef = MST_NETWORKS[net];
+      const contractAddr = getContractAddressForNetwork(net);
+      if (contractAddr && ethers.isAddress(contractAddr)) {
+        const provider = new ethers.JsonRpcProvider(netDef.rpcUrl);
+        const contract = new ethers.Contract(contractAddr, contractArtifact.abi, provider);
+        const onChainAdmin = await contract.admin();
+        if (onChainAdmin && ethers.isAddress(onChainAdmin)) {
+          return onChainAdmin.toLowerCase();
+        }
+      }
+    } catch {
+      // Continue to next candidate network
+    }
+  }
+  return null;
+}
+
+export interface DeploymentGasEstimate {
+  gasLimit: bigint;
+  gasPrice: bigint;
+  estimatedCostWei: bigint;
+  estimatedCostFormatted: string;
+}
+
+/**
+ * Safely estimates the gas fee required to deploy NotaryVaultRegistry on Mainnet.
+ */
+export async function estimateMainnetDeploymentGas(
+  rawProvider: any
+): Promise<DeploymentGasEstimate | null> {
+  try {
+    if (!rawProvider) return null;
+    const browserProvider = new ethers.BrowserProvider(rawProvider);
+    const signer = await browserProvider.getSigner();
+    const signerAddress = await signer.getAddress();
+    const factory = new ethers.ContractFactory(contractArtifact.abi, contractArtifact.bytecode, signer);
+    const deployTx = await factory.getDeployTransaction(signerAddress);
+    const gasLimit = await browserProvider.estimateGas(deployTx);
+    const feeData = await browserProvider.getFeeData();
+    const gasPrice = feeData.gasPrice || 1000000000n; // 1 gwei fallback
+    const estimatedCostWei = gasLimit * gasPrice;
+    return {
+      gasLimit,
+      gasPrice,
+      estimatedCostWei,
+      estimatedCostFormatted: ethers.formatEther(estimatedCostWei),
+    };
+  } catch {
+    const fallbackGas = 3500000n;
+    const fallbackPrice = 1000000000n;
+    const estimatedCostWei = fallbackGas * fallbackPrice;
+    return {
+      gasLimit: fallbackGas,
+      gasPrice: fallbackPrice,
+      estimatedCostWei,
+      estimatedCostFormatted: ethers.formatEther(estimatedCostWei),
+    };
+  }
+}
+
+export interface MainnetDeploymentResult {
+  success: boolean;
+  contractAddress?: string;
+  txHash?: string;
+  blockNumber?: number;
+  deployerAddress?: string;
+  error?: string;
+}
+
+/**
+ * Executes on-chain deployment of NotaryVaultRegistry to MST Chain Mainnet.
+ * Strict conditions:
+ * 1. Connected wallet must be verified on-chain as current Super Author.
+ * 2. Connected wallet must be on chain ID 4646 (0x1226).
+ * 3. Verified NotaryVault contract must not already be configured on Mainnet.
+ * 4. Waits for real mined transaction receipt (status === 1).
+ * 5. Verifies deployed contract bytecode and essential methods on-chain before saving.
+ */
+export async function deployMainnetContract(
+  rawProvider: any,
+  onProgress?: (status: string) => void
+): Promise<MainnetDeploymentResult> {
+  if (!rawProvider) {
+    throw new Error('No wallet provider detected. Please connect your BridgeKey or EVM wallet.');
+  }
+
+  const browserProvider = new ethers.BrowserProvider(rawProvider);
+  const network = await browserProvider.getNetwork();
+  const chainIdNumber = Number(network.chainId);
+
+  // 1. Strict Chain ID verification
+  if (chainIdNumber !== 4646) {
+    throw new Error(
+      `Incorrect network: Connected wallet is on Chain ID ${chainIdNumber} (0x${network.chainId.toString(16)}). Mainnet contract deployment requires MST Chain Mainnet (Chain ID: 4646 / 0x1226). Please switch networks in your wallet.`
+    );
+  }
+
+  // 2. Strict Super Author authorization verification
+  const signer = await browserProvider.getSigner();
+  const signerAddress = await signer.getAddress();
+  const onChainSuperAuthor = await getOnChainSuperAuthor();
+
+  if (!onChainSuperAuthor || signerAddress.toLowerCase() !== onChainSuperAuthor.toLowerCase()) {
+    throw new Error(
+      `Unauthorized: Connected wallet ${signerAddress} is not verified on-chain as the current Super Author (${onChainSuperAuthor || 'unverified'}). Mainnet deployment is strictly restricted to the Super Author.`
+    );
+  }
+
+  // 3. Pre-flight check: ensure valid contract is not already configured on Mainnet
+  const existingConfigured = getContractAddressForNetwork('mainnet');
+  if (existingConfigured && ethers.isAddress(existingConfigured)) {
+    try {
+      const code = await browserProvider.getCode(existingConfigured);
+      if (code && code !== '0x' && code.length > 100) {
+        return {
+          success: false,
+          contractAddress: existingConfigured,
+          error: `A valid NotaryVaultRegistry smart contract is already deployed and configured on Mainnet at ${existingConfigured}. Duplicate deployment is blocked.`
+        };
+      }
+    } catch {}
+  }
+
+  // 4. Verify balance
+  const balance = await browserProvider.getBalance(signerAddress);
+  if (balance === 0n) {
+    throw new Error(
+      `Insufficient funds: Deployer wallet ${signerAddress} has 0 MSTC balance on MST Chain Mainnet. You must fund this wallet with MSTC tokens for contract deployment gas fees.`
+    );
+  }
+
+  onProgress?.('Preparing deployment transaction with project ABI and bytecode...');
+
+  // 5. Instantiate ContractFactory with project artifact
+  const factory = new ethers.ContractFactory(contractArtifact.abi, contractArtifact.bytecode, signer);
+
+  onProgress?.('Awaiting wallet confirmation... Please approve the deployment transaction in your wallet.');
+
+  // 6. Request deployment transaction through connected wallet
+  let contract: ethers.BaseContract;
+  try {
+    contract = await factory.deploy(signerAddress);
+  } catch (err: any) {
+    const parsedErr = parseContractError(err);
+    if (
+      parsedErr.includes('rejected') || 
+      parsedErr.includes('denied') || 
+      parsedErr.includes('User denied') || 
+      parsedErr.includes('ACTION_REJECTED')
+    ) {
+      throw new Error('Deployment transaction was rejected in your wallet.');
+    }
+    throw new Error(`Wallet deployment request failed: ${parsedErr}`);
+  }
+
+  const deployTx = (contract as any).deploymentTransaction();
+  if (!deployTx) {
+    throw new Error('Deployment transaction was not created by the wallet provider.');
+  }
+
+  const submittedTxHash = deployTx.hash;
+  onProgress?.(`Transaction broadcast! Hash: ${submittedTxHash}. Waiting for on-chain block mining...`);
+
+  // 7. Wait for actual transaction receipt
+  const receipt = await deployTx.wait();
+  if (!receipt || receipt.status !== 1) {
+    throw new Error(
+      `Deployment transaction failed or reverted on MST Chain Mainnet. Status: ${receipt?.status}`
+    );
+  }
+
+  const deployedAddress = await contract.getAddress();
+  onProgress?.(`Transaction confirmed in block #${receipt.blockNumber}. Verifying contract bytecode at ${deployedAddress}...`);
+
+  // 8. Verify contract bytecode exists at deployed address
+  const code = await browserProvider.getCode(deployedAddress);
+  if (!code || code === '0x' || code.length <= 100) {
+    throw new Error(
+      `Verification failed: No contract bytecode exists at deployed address ${deployedAddress}.`
+    );
+  }
+
+  // 9. Verify expected configuration and essential functions on-chain
+  onProgress?.('Verifying contract admin and registry functions on-chain...');
+  const deployedContract = new ethers.Contract(deployedAddress, contractArtifact.abi, browserProvider);
+  const onChainAdmin = await deployedContract.admin();
+  if (onChainAdmin.toLowerCase() !== signerAddress.toLowerCase()) {
+    throw new Error(
+      `Verification failed: Deployed contract admin (${onChainAdmin}) does not match expected deployer (${signerAddress}).`
+    );
+  }
+
+  const totalDocs = await deployedContract.totalDocumentsRegistered();
+  if (totalDocs !== 0n) {
+    throw new Error('Verification failed: New registry initial document count is not zero.');
+  }
+
+  // 10. Persist verified deployment record
+  const deploymentRecord = {
+    network: 'MST Chain Mainnet',
+    chainId: '0x1226',
+    chainIdDecimal: 4646,
+    rpcUrl: MST_NETWORKS.mainnet.rpcUrl,
+    blockExplorerUrl: MST_NETWORKS.mainnet.explorerBaseUrl,
+    nativeCurrency: { name: 'MSTC', symbol: 'MSTC', decimals: 18 },
+    contractAddress: deployedAddress,
+    deploymentTxHash: receipt.hash || submittedTxHash,
+    deployedAtBlock: receipt.blockNumber ? Number(receipt.blockNumber) : null,
+    deployerAddress: signerAddress,
+    deployed: true,
+    deployedAt: new Date().toISOString(),
+  };
+
+  await saveMainnetDeploymentRecord(deploymentRecord);
+
+  onProgress?.('Deployment verified and saved successfully!');
+
+  return {
+    success: true,
+    contractAddress: deployedAddress,
+    txHash: receipt.hash || submittedTxHash,
+    blockNumber: receipt.blockNumber ? Number(receipt.blockNumber) : undefined,
+    deployerAddress: signerAddress,
+  };
+}
+
+/**
+ * Persists Mainnet deployment record to memory, localStorage, and notifies backend server.
+ */
+export async function saveMainnetDeploymentRecord(record: any): Promise<void> {
+  // 1. Update in-memory configuration
+  if (deploymentConfig && deploymentConfig.mainnet) {
+    deploymentConfig.mainnet.contractAddress = record.contractAddress;
+    deploymentConfig.mainnet.deploymentTxHash = record.deploymentTxHash;
+    deploymentConfig.mainnet.deployedAtBlock = record.deployedAtBlock;
+    deploymentConfig.mainnet.deployerAddress = record.deployerAddress;
+    deploymentConfig.mainnet.deployed = true;
+    deploymentConfig.mainnet.deployedAt = record.deployedAt;
+  }
+
+  // 2. Persist in localStorage
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.setItem('notaryvault_mainnet_contract_address', record.contractAddress);
+      window.localStorage.setItem('notaryvault_mainnet_deployment', JSON.stringify(record));
+    } catch (e) {
+      console.warn('Could not save Mainnet deployment to localStorage:', e);
+    }
+  }
+
+  // 3. Notify backend server to persist into src/contracts/deployment.json
+  try {
+    const backendUrl = typeof window !== 'undefined' && (window as any).__NOTARYVAULT_STORAGE_URL__
+      ? (window as any).__NOTARYVAULT_STORAGE_URL__
+      : 'http://localhost:5001';
+
+    await fetch(`${backendUrl}/api/deployment/record`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Wallet-Address': record.deployerAddress || '',
+      },
+      body: JSON.stringify({
+        networkKey: 'mainnet',
+        contractAddress: record.contractAddress,
+        txHash: record.deploymentTxHash,
+        blockNumber: record.deployedAtBlock,
+        deployerAddress: record.deployerAddress,
+      }),
+    });
+  } catch {
+    // Backend offline / optional — localStorage & memory remain active
+  }
+
+  // 4. Emit window event for components to reactively update
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('notaryvault:mainnet-deployed', { detail: record }));
+  }
+}
+

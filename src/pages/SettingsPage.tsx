@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AppShell } from '../components/layout/AppShell';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -20,8 +20,10 @@ import {
 import { 
   isContractConfigured, 
   getDeploymentConfig, 
-  getExplorerAddressUrl 
+  getExplorerAddressUrl,
+  getExplorerTxUrl
 } from '../services/contractService';
+import { DeployMainnetModal } from '../components/contract/DeployMainnetModal';
 
 export const SettingsPage: React.FC = () => {
   const { resetAllDemoData, addToast } = useDocuments();
@@ -33,11 +35,23 @@ export const SettingsPage: React.FC = () => {
     walletName, 
     isBridgeKeyDetected, 
     cancelConnection,
-    selectedNetwork 
+    selectedNetwork,
+    isSuperAuthor,
+    contractAdminAddress,
+    canDeployMainnetContract
   } = useWallet();
 
   const [activeTab, setActiveTab] = useState<'profile' | 'wallet' | 'security' | 'reset'>('profile');
   const [resetModalOpen, setResetModalOpen] = useState(false);
+  const [resetActionError, setResetActionError] = useState<string | null>(null);
+  const [deployModalOpen, setDeployModalOpen] = useState(false);
+
+  // If a non-Super Author is on 'reset' tab (e.g. from state or wallet switch), redirect to 'profile'
+  useEffect(() => {
+    if (!isSuperAuthor && activeTab === 'reset') {
+      setActiveTab('profile');
+    }
+  }, [isSuperAuthor, activeTab]);
 
   // Profile Form state
   const [name, setName] = useState('');
@@ -49,9 +63,25 @@ export const SettingsPage: React.FC = () => {
     addToast('Profile Saved', 'User profile preferences updated locally.');
   };
 
-  const handleConfirmReset = () => {
-    resetAllDemoData();
-    setResetModalOpen(false);
+  const handleConfirmReset = async () => {
+    setResetActionError(null);
+    if (!isSuperAuthor) {
+      const errMsg = 'Super Author access required: Only the root Super Author can clear stored data.';
+      setResetActionError(errMsg);
+      addToast('Access Denied', errMsg, 'error');
+      setResetModalOpen(false);
+      return;
+    }
+
+    try {
+      await resetAllDemoData();
+      setResetModalOpen(false);
+    } catch (err: any) {
+      const errMsg = err?.message || 'Super Author access required: Only the root Super Author can clear stored data.';
+      setResetActionError(errMsg);
+      addToast('Access Denied', errMsg, 'error');
+      setResetModalOpen(false);
+    }
   };
 
   return (
@@ -99,17 +129,19 @@ export const SettingsPage: React.FC = () => {
             <span>Security & Cryptography</span>
           </button>
 
-          <button
-            onClick={() => setActiveTab('reset')}
-            className={`py-3 px-4 border-b-2 font-semibold transition-colors flex items-center gap-2 whitespace-nowrap cursor-pointer ${
-              activeTab === 'reset'
-                ? 'border-rose-500 text-rose-600'
-                : 'border-transparent text-stone-500 hover:text-rose-600'
-            }`}
-          >
-            <Trash2 className="w-4 h-4" />
-            <span>Clear Stored Data</span>
-          </button>
+          {isSuperAuthor && (
+            <button
+              onClick={() => setActiveTab('reset')}
+              className={`py-3 px-4 border-b-2 font-semibold transition-colors flex items-center gap-2 whitespace-nowrap cursor-pointer ${
+                activeTab === 'reset'
+                  ? 'border-rose-500 text-rose-600'
+                  : 'border-transparent text-stone-500 hover:text-rose-600'
+              }`}
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>Clear Stored Data</span>
+            </button>
+          )}
         </div>
 
         {/* =========================================================================
@@ -399,28 +431,72 @@ export const SettingsPage: React.FC = () => {
                     </a>
                   </div>
                   {isContractConfigured('mainnet') ? (
-                    <div className="p-2 bg-white/70 rounded-lg sm:col-span-2 flex items-center justify-between">
-                      <div className="min-w-0 pr-2">
-                        <span className="text-stone-500 block text-[10px] uppercase font-sans">Deployed Contract Address</span>
-                        <span className="text-purple-900 font-mono break-all text-[11px]">
-                          {getDeploymentConfig('mainnet').contractAddress}
-                        </span>
+                    <>
+                      <div className="p-2 bg-white/70 rounded-lg sm:col-span-2 flex items-center justify-between">
+                        <div className="min-w-0 pr-2">
+                          <span className="text-stone-500 block text-[10px] uppercase font-sans">Deployed Contract Address</span>
+                          <span className="text-purple-900 font-mono break-all text-[11px]">
+                            {getDeploymentConfig('mainnet').contractAddress}
+                          </span>
+                        </div>
+                        <a
+                          href={getExplorerAddressUrl(getDeploymentConfig('mainnet').contractAddress, 'mainnet')}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-purple-600 hover:underline flex items-center gap-1 text-[11px] font-sans font-semibold shrink-0"
+                        >
+                          <span>Contract</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
                       </div>
-                      <a
-                        href={getExplorerAddressUrl(getDeploymentConfig('mainnet').contractAddress, 'mainnet')}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-purple-600 hover:underline flex items-center gap-1 text-[11px] font-sans font-semibold shrink-0"
-                      >
-                        <span>Contract</span>
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
+                      {getDeploymentConfig('mainnet').deploymentTxHash && (
+                        <div className="p-2 bg-white/70 rounded-lg sm:col-span-2 flex items-center justify-between">
+                          <div className="min-w-0 pr-2">
+                            <span className="text-stone-500 block text-[10px] uppercase font-sans">Deployment Transaction Hash</span>
+                            <span className="text-stone-700 font-mono break-all text-[11px]">
+                              {getDeploymentConfig('mainnet').deploymentTxHash}
+                            </span>
+                          </div>
+                          <a
+                            href={getExplorerTxUrl(getDeploymentConfig('mainnet').deploymentTxHash, 'mainnet')}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-purple-600 hover:underline flex items-center gap-1 text-[11px] font-sans font-semibold shrink-0"
+                          >
+                            <span>MSTScan</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
+                      )}
+                    </>
+                  ) : canDeployMainnetContract ? (
+                    <div className="p-3.5 bg-gradient-to-r from-purple-50 via-white to-purple-50/50 border border-purple-200 rounded-xl sm:col-span-2 space-y-2">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="space-y-0.5">
+                          <span className="font-bold text-xs text-purple-950 flex items-center gap-1.5">
+                            <ShieldCheck className="w-4 h-4 text-purple-700 shrink-0" />
+                            Super Author Mainnet Deployment Authorization
+                          </span>
+                          <p className="text-[11px] text-stone-600">
+                            Connected wallet is verified on-chain as the Super Author on MST Chain Mainnet.
+                          </p>
+                        </div>
+                        <Button
+                          variant="primary-app"
+                          size="sm"
+                          onClick={() => setDeployModalOpen(true)}
+                          icon={<ShieldCheck className="w-4 h-4" />}
+                          className="shrink-0"
+                        >
+                          Deploy Mainnet Contract
+                        </Button>
+                      </div>
                     </div>
                   ) : (
                     <div className="p-2.5 bg-white/70 rounded-lg sm:col-span-2 text-stone-600 flex items-center justify-between">
-                      <span>Not deployed yet to Mainnet.</span>
-                      <span className="font-mono text-[10px] bg-stone-100 text-stone-700 px-2 py-0.5 rounded border border-black/5">
-                        npm run deploy:mst:mainnet
+                      <span>Contract not deployed to MST Chain Mainnet yet.</span>
+                      <span className="font-mono text-[10px] bg-stone-100 text-stone-600 px-2 py-0.5 rounded border border-black/5">
+                        Requires Super Author on Chain 4646
                       </span>
                     </div>
                   )}
@@ -438,64 +514,108 @@ export const SettingsPage: React.FC = () => {
         )}
 
         {/* =========================================================================
-            TAB 5: CLEAR STORED DATA
+            TAB 5: CLEAR STORED DATA (Strictly Super Author Only)
             ========================================================================= */}
         {activeTab === 'reset' && (
-          <Card className="p-6 md:p-8 space-y-6 bg-white border border-rose-200">
-            <div>
-              <h3 className="text-lg font-bold text-rose-950">Clear Stored Documents & Audit Data</h3>
-              <p className="text-xs text-stone-500 mt-0.5">
-                Remove all registered documents, activity timeline records, and sharing links from browser storage.
+          isSuperAuthor ? (
+            <Card className="p-6 md:p-8 space-y-6 bg-white border border-rose-200">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-lg font-bold text-rose-950">Clear Stored Documents & Audit Data</h3>
+                  <span className="px-2 py-0.5 bg-rose-100 text-rose-800 rounded-full font-mono text-[10px] font-bold">
+                    Super Author Only
+                  </span>
+                </div>
+                <p className="text-xs text-stone-500 mt-0.5">
+                  Administrative action for the designated Super Author to purge local browser storage caches on this device.
+                </p>
+              </div>
+
+              {resetActionError && (
+                <div className="p-3 bg-red-50 text-red-800 rounded-xl border border-red-200 text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                  <span>{resetActionError}</span>
+                </div>
+              )}
+
+              <div className="p-4 bg-rose-50 rounded-2xl border border-rose-200 text-xs text-rose-900 space-y-2">
+                <div className="font-bold flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-rose-700" />
+                  <span>Blockchain Immutability & Persistence Guarantee</span>
+                </div>
+                <p className="leading-relaxed text-[11px]">
+                  This action clears browser-local storage, cached drafts, and local activity timeline records on this machine.
+                  <strong> All on-chain registrations, smart contract author permissions, and blockchain audit logs on the MST Chain remain permanent, tamper-proof, and immutable.</strong>
+                </p>
+              </div>
+
+              <Button
+                variant="danger"
+                size="sm"
+                icon={<Trash2 className="w-4 h-4" />}
+                onClick={() => {
+                  setResetActionError(null);
+                  setResetModalOpen(true);
+                }}
+              >
+                Clear All Stored Data
+              </Button>
+            </Card>
+          ) : (
+            <Card className="p-6 md:p-8 space-y-4 bg-rose-50 border border-rose-200 text-rose-950">
+              <div className="flex items-center gap-3">
+                <AlertCircle className="w-5 h-5 text-rose-600 shrink-0" />
+                <h3 className="text-base font-bold text-rose-950">Super Author Access Required</h3>
+              </div>
+              <p className="text-xs text-rose-800 leading-relaxed">
+                Clearing stored application and repository data is strictly restricted to the root Super Author ({contractAdminAddress ? `${contractAdminAddress.slice(0, 6)}...${contractAdminAddress.slice(-4)}` : '0x6D96...00C4'}).
+                Secondary Authors and Public Users do not possess administrative permissions for this operation.
               </p>
-            </div>
-
-            <div className="p-4 bg-rose-50 rounded-2xl border border-rose-200 text-xs text-rose-900 leading-relaxed">
-              <strong>Notice:</strong> This action will erase all documents and records stored locally in your browser's localStorage. The Document Library and Activity History will return to clean empty states.
-            </div>
-
-            <Button
-              variant="danger"
-              size="sm"
-              icon={<Trash2 className="w-4 h-4" />}
-              onClick={() => setResetModalOpen(true)}
-            >
-              Clear All Stored Data
-            </Button>
-          </Card>
+            </Card>
+          )
         )}
 
       </div>
 
       {/* Clear Stored Data Confirmation Modal */}
-      <Modal
-        isOpen={resetModalOpen}
-        onClose={() => setResetModalOpen(false)}
-        title="Confirm Clear Stored Data"
-        subtitle="This action will clear all local records."
-      >
-        <div className="space-y-4">
-          <p className="text-xs text-stone-600 leading-relaxed">
-            Are you sure you want to clear all stored document records, verification histories, and sharing entries from local storage? This action cannot be undone.
-          </p>
+      {isSuperAuthor && (
+        <Modal
+          isOpen={resetModalOpen}
+          onClose={() => setResetModalOpen(false)}
+          title="Confirm Clear Stored Data"
+          subtitle="Super Author confirmation required."
+        >
+          <div className="space-y-4">
+            <p className="text-xs text-stone-600 leading-relaxed">
+              Are you sure you want to clear all stored document records, verification histories, and sharing entries from local storage?
+              Blockchain records on MST Chain will remain unaffected. This local action cannot be undone.
+            </p>
 
-          <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/[0.06]">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setResetModalOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="danger"
-              size="sm"
-              onClick={handleConfirmReset}
-            >
-              Confirm Clear
-            </Button>
+            <div className="flex items-center justify-end gap-3 pt-3 border-t border-black/[0.06]">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setResetModalOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={handleConfirmReset}
+              >
+                Confirm Clear
+              </Button>
+            </div>
           </div>
-        </div>
-      </Modal>
+        </Modal>
+      )}
+
+      {/* Mainnet Contract Deployment Modal */}
+      <DeployMainnetModal
+        isOpen={deployModalOpen}
+        onClose={() => setDeployModalOpen(false)}
+      />
 
     </AppShell>
   );

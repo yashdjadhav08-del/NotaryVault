@@ -20,10 +20,11 @@ import {
 import { Button } from '../components/ui/Button';
 import { formatDateTime, formatRelativeTime } from '../lib/format';
 import { useWallet } from '../context/WalletContext';
+import { getExplorerTxUrl } from '../services/contractService';
 
 export const ActivityHistoryPage: React.FC = () => {
   const { activities, isSyncing, syncWithBlockchain } = useDocuments();
-  const { selectedNetwork } = useWallet();
+  const { selectedNetwork, activeNetworkConfig } = useWallet();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedEventType, setSelectedEventType] = useState<string>('all');
@@ -59,17 +60,17 @@ export const ActivityHistoryPage: React.FC = () => {
 
   return (
     <AppShell
-      title="Activity History"
-      subtitle="Complete chronological audit trail of document registrations, SHA-256 verifications, and sharing events."
+      title={`Activity History (${selectedNetwork === 'mainnet' ? 'Mainnet' : 'Testnet'})`}
+      subtitle={`Chronological audit trail of document registrations, verifications, and sharing events on ${activeNetworkConfig.name}.`}
       actions={
         <Button
           variant="secondary"
           size="sm"
           icon={<RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin text-blue-600' : 'text-stone-500'}`} />}
           onClick={() => syncWithBlockchain(selectedNetwork, true)}
-          title="Sync audit trail from MST Chain events"
+          title={`Sync audit trail from ${activeNetworkConfig.name}`}
         >
-          {isSyncing ? 'Syncing...' : 'Sync History'}
+          <span className="hidden sm:inline">{isSyncing ? 'Syncing...' : 'Sync History'}</span>
         </Button>
       }
     >
@@ -110,8 +111,12 @@ export const ActivityHistoryPage: React.FC = () => {
         {/* Timeline of Events */}
         {activities.length === 0 ? (
           <EmptyState
-            title="No activity available"
-            description="No activity has been logged yet. Document registrations, verification checks, and sharing events will be recorded here."
+            title={`No ${selectedNetwork === 'mainnet' ? 'Mainnet' : 'Testnet'} activity available`}
+            description={
+              selectedNetwork === 'mainnet'
+                ? "No activity records have been logged on MST Chain Mainnet. Smart contract is not yet deployed or transactions have not occurred."
+                : "No activity has been logged yet on MST Chain Testnet. Document registrations, verification checks, and sharing events will be recorded here."
+            }
           />
         ) : filteredActivities.length === 0 ? (
           <EmptyState
@@ -140,6 +145,22 @@ export const ActivityHistoryPage: React.FC = () => {
                         <span className="text-[11px] px-2 py-0.5 rounded-full bg-stone-200/60 font-medium text-stone-600">
                           {act.type}
                         </span>
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase border ${
+                          (act.networkKey || selectedNetwork) === 'mainnet'
+                            ? 'bg-purple-100 text-purple-900 border-purple-200'
+                            : 'bg-blue-100 text-blue-900 border-blue-200'
+                        }`}>
+                          {(act.networkKey || selectedNetwork) === 'mainnet' ? 'MAINNET' : 'TESTNET'}
+                        </span>
+                        {act.isOnChain ? (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-emerald-100 text-emerald-800 border border-emerald-200">
+                            Confirmed On-Chain
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-stone-200 text-stone-700">
+                            Local Baseline
+                          </span>
+                        )}
                       </div>
                       <span className="text-xs text-stone-400 font-mono" title={formatDateTime(act.timestamp)}>
                         {formatRelativeTime(act.timestamp)}
@@ -150,20 +171,33 @@ export const ActivityHistoryPage: React.FC = () => {
                       {act.description}
                     </p>
 
-                    {act.documentId && (
-                      <div className="mt-2.5 pt-2 border-t border-black/[0.04] flex items-center justify-between">
-                        <Link
-                          to={`/app/documents/${act.documentId}`}
-                          className="inline-flex items-center gap-1 font-mono text-xs text-[#1F6FF0] hover:underline font-semibold"
-                        >
-                          <span>{act.documentId}</span>
-                          <ExternalLink className="w-3 h-3" />
-                        </Link>
-                        <span className="text-[10px] text-stone-400">
-                          {formatDateTime(act.timestamp)}
-                        </span>
+                    <div className="mt-2.5 pt-2 border-t border-black/[0.04] flex items-center justify-between flex-wrap gap-2">
+                      <div className="flex items-center gap-3">
+                        {act.documentId && (
+                          <Link
+                            to={`/app/documents/${act.documentId}`}
+                            className="inline-flex items-center gap-1 font-mono text-xs text-[#1F6FF0] hover:underline font-semibold"
+                          >
+                            <span>{act.documentId}</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </Link>
+                        )}
+                        {act.txHash && (
+                          <a
+                            href={getExplorerTxUrl(act.txHash, act.networkKey || selectedNetwork)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 font-mono text-xs text-purple-700 hover:underline font-semibold"
+                          >
+                            <span>Tx: {act.txHash.slice(0, 12)}...</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        )}
                       </div>
-                    )}
+                      <span className="text-[10px] text-stone-400">
+                        {formatDateTime(act.timestamp)}
+                      </span>
+                    </div>
                   </div>
                 </div>
               ))}

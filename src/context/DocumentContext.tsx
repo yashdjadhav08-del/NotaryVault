@@ -18,6 +18,7 @@ import {
   mergeActivities,
   resetDemoData as resetStorage 
 } from '../lib/storage';
+import { useWallet } from './WalletContext';
 import { 
   generateUniqueDocumentId, 
   generateUUID, 
@@ -42,6 +43,7 @@ import {
   getOnChainIdByHash, 
   checkDocumentIdExists,
   recoverOnChainRecords,
+  isChainIdMatchingNetwork,
   MST_NETWORKS, 
   type MSTNetworkKey 
 } from '../services/contractService';
@@ -59,6 +61,7 @@ export interface RegisterParams {
   type: DocumentType;
   description: string;
   owner: string;
+  walletAddress?: string;
   issueDate: string;
   expiryDate?: string;
   propertyId?: string;
@@ -105,34 +108,59 @@ interface DocumentContextType {
 const DocumentContext = createContext<DocumentContextType | undefined>(undefined);
 
 export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  // Synchronous initialization from localStorage ensures state is immediately populated on first render
-  const [documents, setDocuments] = useState<DocumentRecord[]>(() => loadDocuments());
-  const [sharedRecords, setSharedRecords] = useState<SharedRecord[]>(() => loadSharedRecords());
-  const [activities, setActivities] = useState<ActivityEvent[]>(() => loadActivities());
+  let isSuperAuthor = false;
+  let callerAddress: string | null = null;
+  let selectedNetwork: MSTNetworkKey = 'testnet';
+  let walletChainId: string | null = null;
+
+  try {
+    const wallet = useWallet();
+    isSuperAuthor = Boolean(wallet?.isSuperAuthor);
+    callerAddress = wallet?.address || null;
+    selectedNetwork = wallet?.selectedNetwork || 'testnet';
+    walletChainId = wallet?.chainId || null;
+  } catch {
+    isSuperAuthor = false;
+    callerAddress = null;
+    selectedNetwork = 'testnet';
+    walletChainId = null;
+  }
+
+  // Synchronous initialization from localStorage partitioned by active network
+  const [documents, setDocuments] = useState<DocumentRecord[]>(() => loadDocuments(selectedNetwork));
+  const [sharedRecords, setSharedRecords] = useState<SharedRecord[]>(() => loadSharedRecords(selectedNetwork));
+  const [activities, setActivities] = useState<ActivityEvent[]>(() => loadActivities(selectedNetwork));
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [syncError, setSyncError] = useState<string | null>(null);
 
   const isMountedRef = useRef<boolean>(true);
 
-  // Sync on mount and restore any missing on-chain documents / activities
+  // React to network changes: switch local catalogs and trigger on-chain sync
   useEffect(() => {
     isMountedRef.current = true;
+    setDocuments(loadDocuments(selectedNetwork));
+    setSharedRecords(loadSharedRecords(selectedNetwork));
+    setActivities(loadActivities(selectedNetwork));
 
-    // Background on-chain synchronization
-    syncWithBlockchain('testnet');
+    if (isContractConfigured(selectedNetwork)) {
+      syncWithBlockchain(selectedNetwork);
+    } else {
+      setIsSyncing(false);
+      setSyncError(null);
+    }
 
     return () => {
       isMountedRef.current = false;
     };
-  }, []);
+  }, [selectedNetwork]);
 
   /**
    * Recovers and synchronizes on-chain registration records and event logs
    * into the local application catalog.
    */
   const syncWithBlockchain = async (
-    networkKey: MSTNetworkKey = 'testnet',
+    networkKey: MSTNetworkKey = selectedNetwork,
     force: boolean = false
   ): Promise<{ recoveredCount: number; error?: string }> => {
     if (isSyncing && !force) {
@@ -140,6 +168,8 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
 
     if (!isContractConfigured(networkKey)) {
+      setIsSyncing(false);
+      setSyncError(null);
       return { recoveredCount: 0 };
     }
 
@@ -163,13 +193,13 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
           const existingIds = new Set(prev.map(d => d.id.toUpperCase()));
           const merged = mergeDocuments(prev, recovered.documents);
           restoredCount = merged.filter(d => !existingIds.has(d.id.toUpperCase())).length;
-          saveDocuments(merged);
+          saveDocuments(merged, networkKey);
           return merged;
         });
 
         setActivities(prev => {
           const merged = mergeActivities(prev, recovered.activities);
-          saveActivities(merged);
+          saveActivities(merged, networkKey);
           return merged;
         });
 
@@ -242,8 +272,21 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       };
     }
 
-    // 2. Check on-chain (active v2 contract + historical v1 contract e.g. NV-2026-566456)
-    const targetNet = networkKey || 'testnet';
+    // 2. Check on-chain (active contract + historical deployments)
+    const targetNet: MSTNetworkKey = networkKey || 'testnet';
+
+    // Fast-path: When smart contract is not deployed (e.g. Mainnet prior to deployment)
+    // Requirement 8: Clearly show that on-chain uniqueness verification is unavailable
+    if (!isContractConfigured(targetNet)) {
+      return {
+        available: true,
+        source: 'contract_unconfigured',
+        warning: targetNet === 'mainnet'
+          ? 'On-chain uniqueness verification is unavailable (Mainnet smart contract is not yet deployed).'
+          : `On-chain uniqueness verification is unavailable (${targetNet} contract not configured).`,
+      };
+    }
+
     try {
       const onChain = await checkDocumentIdExists(cleanId, targetNet);
       if (onChain.exists) {
@@ -256,21 +299,22 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
           reason: conflictMsg,
         };
       }
-      // If the on-chain check encountered an RPC error but didn't confirm existence,
-      // treat the ID as available with a warning — the on-chain transaction itself
-      // will enforce uniqueness atomically. Never treat an RPC error as proof of collision.
+      
+      // Requirement 7: Do not claim an ID is unique if any required registry check fails
       if (onChain.error) {
         return {
-          available: true,
+          available: false,
           source: 'rpc_error',
+          reason: 'Could not verify Document ID uniqueness on-chain due to an RPC error. Please retry.',
           warning: 'Could not verify Document ID because the RPC request failed. Please retry.',
         };
       }
     } catch {
-      // Network-level failure — treat ID as provisionally available
+      // Requirement 7: Do not claim an ID is unique if any required registry check fails
       return {
-        available: true,
+        available: false,
         source: 'rpc_error',
+        reason: 'Could not verify Document ID uniqueness because the RPC request failed. Please retry.',
         warning: 'Could not verify Document ID because the RPC request failed. Please retry.',
       };
     }
@@ -282,7 +326,16 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
    * Generates a collision-resistant unique Document ID verified against local state and on-chain records.
    */
   const generateAvailableDocumentId = async (networkKey?: MSTNetworkKey): Promise<string> => {
-    const targetNet = networkKey || 'testnet';
+    const targetNet: MSTNetworkKey = networkKey || 'testnet';
+
+    // Fast-path: If smart contract is not deployed, immediately generate unique ID against local catalog
+    if (!isContractConfigured(targetNet)) {
+      return await generateUniqueDocumentId(async (cand) => {
+        const norm = normalizeDocumentId(cand);
+        return documents.some(d => normalizeDocumentId(d.id) === norm);
+      });
+    }
+
     return await generateUniqueDocumentId(async (cand) => {
       const norm = normalizeDocumentId(cand);
       // Local catalog check — authoritative
@@ -376,12 +429,17 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
 
     // 5. Reliable PDF Persistence to Private Backend Storage (Pre-Blockchain Verification)
     // Upload original PDF to private backend storage
+    const resolvedWallet = (params.walletAddress && params.walletAddress.startsWith('0x'))
+      ? params.walletAddress
+      : (callerAddress && callerAddress.startsWith('0x') ? callerAddress : undefined);
+
     const uploadRes = await uploadPdfToServer(candidateId, params.file, {
       fileName: params.file.name,
       sha256Hash,
       fileSizeBytes: params.file.size,
       pageCount: pdfValidation.pageCount,
-      ownerWallet: params.owner,
+      ownerWallet: resolvedWallet,
+      ownerName: params.owner,
       ownerEmail: params.ownerEmail,
       ownerMobile: params.ownerMobile,
       notificationConsent: params.notificationConsent,
@@ -424,42 +482,51 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
 
     // 6. On-Chain MST Chain registration only after verified storage
     if (params.rawProvider) {
-      if (isContractConfigured(targetNet)) {
-        const onChainResult = await registerOnChain(candidateId, sha256Hash, params.type, params.rawProvider, targetNet);
-        if (onChainResult.success) {
-          txHash = onChainResult.txHash;
-          blockNumber = onChainResult.blockNumber;
-          contractAddress = onChainResult.contractAddress;
-          networkChainId = onChainResult.networkChainId;
-          registrantAddress = onChainResult.registrant;
-          onChainStatus = 'registered';
-
-          // Persist transaction hash, block number, network, contract address in server database
-          if (txHash) {
-            await confirmServerRegistration(candidateId, {
-              txHash,
-              blockNumber,
-              networkName: targetNetName,
-              chainId: networkChainId,
-              contractAddress,
-              title: params.name,
-              category: params.type,
-              issuer: params.owner,
-              status: 'confirmed',
-            });
-          }
-
-          addToast(`Registered On ${targetNetName}`, `Confirmed in block #${blockNumber}. Tx: ${txHash?.slice(0, 10)}...`);
-        } else {
-          // Revert cleanly without saving local record or incrementing count
-          throw new Error(onChainResult.error || 'Failed to record on-chain.');
+      if (!isContractConfigured(targetNet)) {
+        if (targetNet === 'mainnet') {
+          throw new Error(
+            'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED: Smart contract has not been deployed or configured on MST Chain Mainnet (Chain ID: 4646 / 0x1226). On-chain registration on Mainnet cannot proceed.'
+          );
         }
-      } else {
-        addToast(
-          'Smart Contract Unconfigured',
-          `Contract not yet deployed to ${targetNetName}. Saved to verified storage catalog.`,
-          'info'
+        throw new Error(`Smart contract is not configured on ${targetNetName}. Cannot proceed with on-chain registration.`);
+      }
+
+      if (walletChainId && !isChainIdMatchingNetwork(walletChainId, targetNet)) {
+        throw new Error(
+          `Wallet network mismatch. Connected to chain ID ${walletChainId}, but selected network is ${targetNetName} (${MST_NETWORKS[targetNet].chainIdDecimal} / ${MST_NETWORKS[targetNet].chainIdHex}). Please switch networks in your wallet before registering.`
         );
+      }
+
+      const onChainResult = await registerOnChain(candidateId, sha256Hash, params.type, params.rawProvider, targetNet);
+      if (onChainResult.success) {
+        txHash = onChainResult.txHash;
+        blockNumber = onChainResult.blockNumber;
+        contractAddress = onChainResult.contractAddress;
+        networkChainId = onChainResult.networkChainId;
+        registrantAddress = onChainResult.registrant;
+        onChainStatus = 'registered';
+
+        // Persist transaction hash, block number, network, contract address in server database
+        if (txHash) {
+          await confirmServerRegistration(candidateId, {
+            txHash,
+            blockNumber,
+            networkName: targetNetName,
+            chainId: networkChainId,
+            contractAddress,
+            registrantAddress,
+            ownerWallet: registrantAddress,
+            title: params.name,
+            category: params.type,
+            issuer: params.owner,
+            status: 'confirmed',
+          });
+        }
+
+        addToast(`Registered On ${targetNetName}`, `Confirmed in block #${blockNumber}. Tx: ${txHash?.slice(0, 10)}...`);
+      } else {
+        // Revert cleanly without saving local record or incrementing count
+        throw new Error(onChainResult.error || 'Failed to record on-chain.');
       }
     }
 
@@ -486,13 +553,14 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       contractAddress,
       networkChainId,
       networkKey: targetNet,
+      networkName: targetNetName,
       registrantAddress,
       onChainStatus,
     };
 
     setDocuments(prev => {
       const merged = mergeDocuments(prev, [newDoc]);
-      saveDocuments(merged);
+      saveDocuments(merged, targetNet);
       return merged;
     });
 
@@ -506,11 +574,18 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       documentId: newDoc.id,
       timestamp: nowIso,
       status: 'success',
+      txHash,
+      blockNumber,
+      networkKey: targetNet,
+      networkName: targetNetName,
+      chainId: networkChainId,
+      contractAddress,
+      isOnChain: onChainStatus === 'registered',
     };
 
     setActivities(prev => {
       const merged = mergeActivities(prev, [newActivity]);
-      saveActivities(merged);
+      saveActivities(merged, targetNet);
       return merged;
     });
 
@@ -840,6 +915,7 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       throw new Error(`Document ${params.documentId} not found.`);
     }
 
+    const docNet = doc.networkKey || selectedNetwork;
     const now = new Date();
     const expiresDate = new Date(now.getTime() + params.durationDays * 24 * 60 * 60 * 1000);
 
@@ -852,11 +928,12 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       expiresAt: expiresDate.toISOString(),
       status: 'Active',
       accessCount: 0,
+      networkKey: docNet,
     };
 
     const updatedShared = [newShared, ...sharedRecords];
     setSharedRecords(updatedShared);
-    saveSharedRecords(updatedShared);
+    saveSharedRecords(updatedShared, docNet);
 
     const newActivity: ActivityEvent = {
       id: generateUUID(),
@@ -866,10 +943,12 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       documentId: doc.id,
       timestamp: now.toISOString(),
       status: 'info',
+      networkKey: docNet,
+      networkName: MST_NETWORKS[docNet]?.name,
     };
     const updatedActs = [newActivity, ...activities];
     setActivities(updatedActs);
-    saveActivities(updatedActs);
+    saveActivities(updatedActs, docNet);
 
     addToast('Share Link Created', `Share reference generated for ${params.recipient}.`);
     return newShared;
@@ -879,11 +958,12 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
     const item = sharedRecords.find(s => s.id === sharedId);
     if (!item) return;
 
+    const itemNet = item.networkKey || selectedNetwork;
     const updated = sharedRecords.map(s => 
       s.id === sharedId ? { ...s, status: 'Revoked' as const } : s
     );
     setSharedRecords(updated);
-    saveSharedRecords(updated);
+    saveSharedRecords(updated, itemNet);
 
     const newAct: ActivityEvent = {
       id: generateUUID(),
@@ -893,18 +973,23 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       documentId: item.documentId,
       timestamp: new Date().toISOString(),
       status: 'warning',
+      networkKey: itemNet,
+      networkName: MST_NETWORKS[itemNet]?.name,
     };
     const updatedActs = [newAct, ...activities];
     setActivities(updatedActs);
-    saveActivities(updatedActs);
+    saveActivities(updatedActs, itemNet);
 
     addToast('Access Revoked', `External access permissions for ${item.recipient} have been revoked.`, 'warning');
   };
 
   const updateDocument = (id: string, updates: Partial<DocumentRecord>) => {
+    const existing = documents.find(d => d.id === id);
+    const net = updates.networkKey || existing?.networkKey || selectedNetwork;
+
     setDocuments(prev => {
       const updated = prev.map(d => d.id === id ? { ...d, ...updates } : d);
-      saveDocuments(updated);
+      saveDocuments(updated, net);
       return updated;
     });
 
@@ -916,10 +1001,12 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       documentId: id,
       timestamp: new Date().toISOString(),
       status: 'info',
+      networkKey: net,
+      networkName: MST_NETWORKS[net]?.name,
     };
     setActivities(prev => {
       const merged = mergeActivities(prev, [newAct]);
-      saveActivities(merged);
+      saveActivities(merged, net);
       return merged;
     });
 
@@ -937,12 +1024,28 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       return false;
     }
 
-    const targetNet: MSTNetworkKey = networkKey || doc.networkKey || 'testnet';
+    const targetNet: MSTNetworkKey = networkKey || doc.networkKey || selectedNetwork || 'testnet';
     const netDef = MST_NETWORKS[targetNet];
 
     if (!isContractConfigured(targetNet)) {
-      const deployCmd = targetNet === 'mainnet' ? 'npm run deploy:mst:mainnet' : 'npm run deploy:mst';
-      addToast('Contract Not Deployed', `Please deploy NotaryVaultRegistry to ${netDef.name} using \`${deployCmd}\`.`, 'error');
+      if (targetNet === 'mainnet') {
+        addToast(
+          'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED',
+          'Smart contract has not been deployed to MST Chain Mainnet (Chain ID 4646). On-chain registration cannot proceed.',
+          'error'
+        );
+      } else {
+        addToast('Contract Not Deployed', `Please deploy NotaryVaultRegistry to ${netDef.name} using \`npm run deploy:mst\`.`, 'error');
+      }
+      return false;
+    }
+
+    if (walletChainId && !isChainIdMatchingNetwork(walletChainId, targetNet)) {
+      addToast(
+        'Network Mismatch',
+        `Please switch your wallet to ${netDef.name} (${netDef.chainIdDecimal}) before submitting.`,
+        'error'
+      );
       return false;
     }
 
@@ -954,6 +1057,7 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
         contractAddress: result.contractAddress,
         networkChainId: result.networkChainId,
         networkKey: targetNet,
+        networkName: netDef.name,
         registrantAddress: result.registrant,
         onChainStatus: 'registered',
       };
@@ -978,17 +1082,38 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       return false;
     }
 
-    const targetNet: MSTNetworkKey = networkKey || doc.networkKey || 'testnet';
+    const targetNet: MSTNetworkKey = networkKey || doc.networkKey || selectedNetwork || 'testnet';
     const netDef = MST_NETWORKS[targetNet];
 
     if (!isContractConfigured(targetNet)) {
-      addToast('Contract Not Deployed', `Smart contract is not configured on ${netDef.name}.`, 'error');
+      if (targetNet === 'mainnet') {
+        addToast(
+          'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED',
+          'Smart contract has not been deployed to MST Chain Mainnet (Chain ID 4646). Revocation cannot proceed.',
+          'error'
+        );
+      } else {
+        addToast('Contract Not Deployed', `Smart contract is not configured on ${netDef.name}.`, 'error');
+      }
+      return false;
+    }
+
+    if (walletChainId && !isChainIdMatchingNetwork(walletChainId, targetNet)) {
+      addToast(
+        'Network Mismatch',
+        `Please switch your wallet to ${netDef.name} (${netDef.chainIdDecimal}) before submitting.`,
+        'error'
+      );
       return false;
     }
 
     const result = await revokeOnChain(doc.id, reason, rawProvider, targetNet);
     if (result.success) {
-      updateDocument(doc.id, { onChainStatus: 'revoked', networkKey: targetNet });
+      updateDocument(doc.id, { 
+        onChainStatus: 'revoked', 
+        networkKey: targetNet,
+        networkName: netDef.name,
+      });
       addToast('Document Revoked', `Document ${doc.id} marked as revoked on ${netDef.name}.`, 'warning');
       return true;
     } else {
@@ -1022,12 +1147,26 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
   };
 
   const resetAllDemoData = () => {
+    if (!isSuperAuthor) {
+      const errMsg = 'Super Author access required: Only the root Super Author can clear stored data.';
+      addToast('Access Denied', errMsg, 'error');
+      throw new Error(errMsg);
+    }
     resetStorage();
     clearAllLocalPDFs().catch(() => {});
     setDocuments([]);
     setSharedRecords([]);
     setActivities([]);
-    addToast('Repository Reset', 'Local repository and cached PDFs cleared to initial state.', 'info');
+    if (callerAddress) {
+      fetch('http://localhost:5001/api/admin/clear-storage', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Wallet-Address': callerAddress,
+        },
+      }).catch(() => {});
+    }
+    addToast('Repository Reset', 'Local repository and cached PDFs cleared by Super Author. On-chain blockchain records remain immutable.', 'info');
   };
 
   return (

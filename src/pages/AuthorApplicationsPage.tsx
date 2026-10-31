@@ -27,7 +27,8 @@ import {
   ShieldCheck,
   ClipboardList,
   FileCheck2,
-  Eye
+  Eye,
+  RefreshCw
 } from 'lucide-react';
 
 interface ReviewChecklistState {
@@ -47,12 +48,16 @@ export const AuthorApplicationsPage: React.FC = () => {
   } = useWallet();
   const { 
     applications, 
-    reviewApplication 
+    reviewApplication,
+    isSyncingOnChain,
+    syncError,
+    syncOnChainApplications
   } = useAuthors();
 
   // List filter state
   const [filterStatus, setFilterStatus] = useState<ApplicationStatus | 'All'>('Pending');
   const [isProcessing, setIsProcessing] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
 
   // Feature 2: Super Author Search State
   const [searchWalletInput, setSearchWalletInput] = useState('');
@@ -195,6 +200,7 @@ export const AuthorApplicationsPage: React.FC = () => {
   const handleApprove = async (app: AuthorApplication) => {
     if (!isSuperAuthor) return;
     setIsProcessing(true);
+    setReviewError(null);
     try {
       const notes = checklist.decisionNotes.trim() || 'Approved by Super Author after credential audit';
       await reviewApplication(app.id, 'Approved', notes, provider);
@@ -209,6 +215,8 @@ export const AuthorApplicationsPage: React.FC = () => {
       }));
       setReviewModalOpen(false);
       setReviewingApp(null);
+    } catch (err: any) {
+      setReviewError(err?.message || 'Transaction was rejected or reverted on-chain.');
     } finally {
       setIsProcessing(false);
     }
@@ -218,6 +226,7 @@ export const AuthorApplicationsPage: React.FC = () => {
   const handleRejectConfirm = async () => {
     if (!isSuperAuthor || !rejectApp) return;
     setIsProcessing(true);
+    setReviewError(null);
     try {
       await reviewApplication(rejectApp.id, 'Rejected', rejectNotes, provider);
       localStorage.setItem(`NV_AUTHOR_REVIEW_${rejectApp.id}`, JSON.stringify({
@@ -231,12 +240,15 @@ export const AuthorApplicationsPage: React.FC = () => {
         setReviewModalOpen(false);
         setReviewingApp(null);
       }
+    } catch (err: any) {
+      setReviewError(err?.message || 'Transaction was rejected or reverted on-chain.');
     } finally {
       setIsProcessing(false);
     }
   };
 
   const openReviewModal = (app: AuthorApplication) => {
+    setReviewError(null);
     setReviewingApp(app);
     setReviewModalOpen(true);
   };
@@ -461,31 +473,57 @@ export const AuthorApplicationsPage: React.FC = () => {
 
             {/* Filter Tabs & Application Counter */}
             <div className="flex items-center justify-between gap-4 flex-wrap pb-2 border-b border-black/[0.06]">
-              <div className="flex items-center gap-1.5 p-1 bg-stone-100 rounded-2xl border border-black/5 text-xs font-semibold">
-                {(['Pending', 'Approved', 'Rejected', 'All'] as const).map(tab => (
-                  <button
-                    key={tab}
-                    onClick={() => setFilterStatus(tab)}
-                    className={`px-3 py-1.5 rounded-xl transition-all cursor-pointer ${
-                      filterStatus === tab
-                        ? 'bg-white text-stone-900 shadow-xs'
-                        : 'text-stone-500 hover:text-stone-900'
-                    }`}
-                  >
-                    {tab}
-                    {tab === 'Pending' && (
-                      <span className="ml-1.5 px-1.5 py-0.2 rounded-full bg-amber-100 text-amber-800 font-mono text-[10px]">
-                        {applications.filter(a => a.status === 'Pending').length}
-                      </span>
-                    )}
-                  </button>
-                ))}
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5 p-1 bg-stone-100 rounded-2xl border border-black/5 text-xs font-semibold">
+                  {(['Pending', 'Approved', 'Rejected', 'All'] as const).map(tab => (
+                    <button
+                      key={tab}
+                      onClick={() => setFilterStatus(tab)}
+                      className={`px-3 py-1.5 rounded-xl transition-all cursor-pointer ${
+                        filterStatus === tab
+                          ? 'bg-white text-stone-900 shadow-xs'
+                          : 'text-stone-500 hover:text-stone-900'
+                      }`}
+                    >
+                      {tab}
+                      {tab === 'Pending' && (
+                        <span className="ml-1.5 px-1.5 py-0.2 rounded-full bg-amber-100 text-amber-800 font-mono text-[10px]">
+                          {applications.filter(a => a.status === 'Pending').length}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => syncOnChainApplications()}
+                  loading={isSyncingOnChain}
+                  icon={<RefreshCw className={`w-3.5 h-3.5 ${isSyncingOnChain ? 'animate-spin' : ''}`} />}
+                  title="Query deployed smart contract on MST Chain Testnet for latest applications"
+                >
+                  Refresh from Blockchain
+                </Button>
               </div>
 
               <span className="text-xs text-stone-400 font-medium">
                 {filteredApps.length} application(s) listed
               </span>
             </div>
+
+            {/* Blockchain Synchronization Error Notice */}
+            {syncError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-900 flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold">Blockchain Synchronization Notice:</span> {syncError}
+                  <p className="text-[11px] text-red-700 mt-0.5">
+                    Could not query events from the MST Chain Testnet node. Please verify RPC network connectivity.
+                  </p>
+                </div>
+              </div>
+            )}
 
             {/* Applications List */}
             {filteredApps.length === 0 ? (
@@ -497,7 +535,7 @@ export const AuthorApplicationsPage: React.FC = () => {
                   No {filterStatus !== 'All' ? filterStatus : ''} Applications
                 </h3>
                 <p className="text-xs text-stone-500 max-w-sm mx-auto">
-                  There are currently no author applications matching the selected status filter.
+                  There are currently no author applications matching the selected status filter on MST Chain Testnet.
                 </p>
               </Card>
             ) : (
@@ -512,7 +550,7 @@ export const AuthorApplicationsPage: React.FC = () => {
                           <UserCheck className="w-5 h-5" />
                         </div>
                         <div>
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
                             <h4 className="text-base font-bold text-[#1C1C1C]">
                               {app.applicantName}
                             </h4>
@@ -525,6 +563,16 @@ export const AuthorApplicationsPage: React.FC = () => {
                             }`}>
                               {app.status}
                             </span>
+                            {app.isOnChain ? (
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full font-mono bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                                On-Chain (Testnet)
+                              </span>
+                            ) : (
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full font-mono bg-amber-50 text-amber-700 border border-amber-200">
+                                Off-Chain Draft
+                              </span>
+                            )}
                           </div>
                           <span className="text-xs font-mono text-stone-400">
                             {app.id} • Submitted {formatDate(app.submittedAt)}
@@ -550,6 +598,7 @@ export const AuthorApplicationsPage: React.FC = () => {
                               size="sm"
                               disabled={isProcessing}
                               onClick={() => {
+                                setReviewError(null);
                                 setRejectApp(app);
                                 setRejectModalOpen(true);
                               }}
@@ -599,6 +648,30 @@ export const AuthorApplicationsPage: React.FC = () => {
                         </button>
                       </div>
                     </div>
+
+                    {/* On-Chain Verification / Hash Display */}
+                    {app.submissionTxHash ? (
+                      <div className="p-2.5 bg-blue-50/60 rounded-xl border border-blue-200/60 flex items-center justify-between text-xs text-blue-950">
+                        <span className="font-medium">
+                          On-Chain Submission Tx: {app.submissionBlockNumber ? `(Block #${app.submissionBlockNumber})` : ''}
+                        </span>
+                        <a
+                          href={`https://testnet.mstscan.com/tx/${app.submissionTxHash}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-mono text-[11px] text-[#1F6FF0] hover:underline inline-flex items-center gap-1"
+                        >
+                          <span>{app.submissionTxHash.slice(0, 12)}...{app.submissionTxHash.slice(-8)}</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
+                    ) : (
+                      !app.isOnChain && (
+                        <div className="p-2.5 bg-amber-50/60 rounded-xl border border-amber-200/60 text-[11px] text-amber-800">
+                          <strong>Note:</strong> Off-chain draft from local browser storage. No blockchain transaction has been confirmed for this submission.
+                        </div>
+                      )
+                    )}
 
                     {/* Justification Box */}
                     <div className="p-3.5 bg-stone-50/80 rounded-xl text-xs text-stone-700 space-y-1">
@@ -657,6 +730,14 @@ export const AuthorApplicationsPage: React.FC = () => {
       >
         {reviewingApp && (
           <div className="space-y-4 text-xs">
+            {reviewError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-900 flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold">Transaction Notice:</span> {reviewError}
+                </div>
+              </div>
+            )}
             
             {/* Applicant Details Table */}
             <div className="p-3.5 bg-stone-50 rounded-2xl border border-black/5 space-y-2">
@@ -889,6 +970,15 @@ export const AuthorApplicationsPage: React.FC = () => {
         subtitle={`Specify the justification for rejecting application ${rejectApp?.id}.`}
       >
         <div className="space-y-4 text-xs">
+          {reviewError && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-900 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold">Transaction Notice:</span> {reviewError}
+              </div>
+            </div>
+          )}
+
           <Textarea
             label="Rejection Notes & Justification *"
             placeholder="e.g. Incomplete bar license verification, jurisdictional mismatch, or invalid official office credentials..."

@@ -22,7 +22,7 @@ import { formatDate } from '../lib/format';
 export const DocumentLibraryPage: React.FC = () => {
   const navigate = useNavigate();
   const { documents, isSyncing, syncError, syncWithBlockchain } = useDocuments();
-  const { selectedNetwork, activeNetworkConfig } = useWallet();
+  const { selectedNetwork, activeNetworkConfig, isAuthor } = useWallet();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedType, setSelectedType] = useState<string>('all');
@@ -67,8 +67,8 @@ export const DocumentLibraryPage: React.FC = () => {
 
   return (
     <AppShell
-      title="Document Library"
-      subtitle="Search, filter, and inspect registered legal deeds and cryptographic verification records."
+      title={`Document Library (${selectedNetwork === 'mainnet' ? 'Mainnet' : 'Testnet'})`}
+      subtitle={`Search, filter, and inspect registered legal deeds and cryptographic verification records on ${activeNetworkConfig.name}.`}
       actions={
         <div className="flex items-center gap-2">
           <Button
@@ -76,18 +76,21 @@ export const DocumentLibraryPage: React.FC = () => {
             size="sm"
             icon={<RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin text-blue-600' : 'text-stone-500'}`} />}
             onClick={() => syncWithBlockchain(selectedNetwork, true)}
-            title="Sync and restore records from MST Chain"
+            title={`Sync and restore records from ${activeNetworkConfig.name}`}
           >
-            {isSyncing ? 'Syncing...' : 'Sync On-Chain'}
+            <span className="hidden sm:inline">{isSyncing ? 'Syncing...' : 'Sync On-Chain'}</span>
           </Button>
-          <Button
-            variant="primary-app"
-            size="sm"
-            icon={<PlusCircle className="w-4 h-4" />}
-            onClick={() => navigate('/app/register')}
-          >
-            Register Document
-          </Button>
+          {isAuthor && (
+            <Button
+              variant="primary-app"
+              size="sm"
+              icon={<PlusCircle className="w-4 h-4" />}
+              onClick={() => navigate('/app/register')}
+            >
+              <span className="hidden sm:inline">Register Document</span>
+              <span className="sm:hidden">Register</span>
+            </Button>
+          )}
         </div>
       }
     >
@@ -192,10 +195,16 @@ export const DocumentLibraryPage: React.FC = () => {
         {/* Documents Table */}
         {documents.length === 0 ? (
           <EmptyState
-            title="No documents available"
-            description="You haven't registered any documents yet. Register your first property deed or legal agreement to begin tracking."
-            actionLabel="Register Document"
-            onAction={() => navigate('/app/register')}
+            title={`No ${selectedNetwork === 'mainnet' ? 'Mainnet' : 'Testnet'} documents available`}
+            description={
+              selectedNetwork === 'mainnet'
+                ? "No documents are currently registered on MST Chain Mainnet. Smart contract is not yet deployed or configured on Mainnet."
+                : (isAuthor
+                    ? "You haven't registered any documents yet on MST Chain Testnet. Register your first property deed or legal agreement to begin tracking."
+                    : "No registered documents are currently present in your view. You can verify document authenticity with a document ID.")
+            }
+            actionLabel={isAuthor ? "Register Document" : "Verify Document"}
+            onAction={() => navigate(isAuthor ? '/app/register' : '/app/verify')}
           />
         ) : filteredDocs.length === 0 ? (
           <EmptyState
@@ -215,7 +224,7 @@ export const DocumentLibraryPage: React.FC = () => {
                 <thead>
                   <tr className="bg-stone-50/80 border-b border-black/[0.06] text-[11px] font-bold text-stone-500 uppercase tracking-wider">
                     <th className="py-3.5 px-6">Document Details</th>
-                    <th className="py-3.5 px-4">Document ID</th>
+                    <th className="py-3.5 px-4">Document ID & Network</th>
                     <th className="py-3.5 px-4">Classification</th>
                     <th className="py-3.5 px-4">Owner / Submitter</th>
                     <th className="py-3.5 px-4">Registered Date</th>
@@ -247,9 +256,18 @@ export const DocumentLibraryPage: React.FC = () => {
                         </div>
                       </td>
 
-                      {/* Document ID */}
-                      <td className="py-4 px-4 font-mono text-xs font-semibold text-stone-700 whitespace-nowrap">
-                        {doc.id}
+                      {/* Document ID & Network Badge */}
+                      <td className="py-4 px-4 whitespace-nowrap">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs font-semibold text-stone-700">{doc.id}</span>
+                          <span className={`px-1.5 py-0.2 rounded text-[9px] font-extrabold uppercase border ${
+                            (doc.networkKey || selectedNetwork) === 'mainnet'
+                              ? 'bg-purple-100 text-purple-900 border-purple-200'
+                              : 'bg-blue-100 text-blue-900 border-blue-200'
+                          }`}>
+                            {(doc.networkKey || selectedNetwork) === 'mainnet' ? 'MAINNET' : 'TESTNET'}
+                          </span>
+                        </div>
                       </td>
 
                       {/* Type */}

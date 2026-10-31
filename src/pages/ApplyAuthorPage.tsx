@@ -14,7 +14,10 @@ import {
   XCircle, 
   ShieldCheck, 
   FileBadge,
-  Send
+  Send,
+  ExternalLink,
+  AlertTriangle,
+  UploadCloud
 } from 'lucide-react';
 
 export const ApplyAuthorPage: React.FC = () => {
@@ -26,7 +29,8 @@ export const ApplyAuthorPage: React.FC = () => {
     isAuthor,
     isSuperAuthor, 
     isSecondaryAuthor,
-    provider
+    provider,
+    selectedNetwork
   } = useWallet();
   const { 
     submitApplication, 
@@ -41,6 +45,7 @@ export const ApplyAuthorPage: React.FC = () => {
   const [justification, setJustification] = useState('');
 
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const existingApp = getApplicationByWallet(address);
@@ -59,8 +64,29 @@ export const ApplyAuthorPage: React.FC = () => {
     return Object.keys(errs).length === 0;
   };
 
+  const handleBroadcastDraft = async () => {
+    if (!existingApp || !provider) return;
+    setIsSubmitting(true);
+    setSubmitError(null);
+
+    try {
+      await submitApplication({
+        applicantName: existingApp.applicantName,
+        organization: existingApp.organization,
+        licenseNumber: existingApp.licenseNumber,
+        contactEmail: existingApp.contactEmail,
+        justification: existingApp.justification,
+      }, provider);
+    } catch (err: any) {
+      setSubmitError(err?.message || 'Transaction was rejected or failed on-chain.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSubmitError(null);
     if (!validate()) return;
     setIsSubmitting(true);
 
@@ -72,8 +98,8 @@ export const ApplyAuthorPage: React.FC = () => {
         contactEmail,
         justification,
       }, provider);
-    } catch {
-      // Toast handles error display
+    } catch (err: any) {
+      setSubmitError(err?.message || 'Transaction was rejected or failed on-chain.');
     } finally {
       setIsSubmitting(false);
     }
@@ -97,7 +123,7 @@ export const ApplyAuthorPage: React.FC = () => {
                 Connect Wallet to Apply
               </h3>
               <p className="text-xs text-blue-800 max-w-md mx-auto mt-1">
-                Your wallet address is used as the cryptographic identifier for author credentials and permission management.
+                Your wallet address is used as the cryptographic identifier for author credentials and permission management on the MST Chain.
               </p>
             </div>
             <Button
@@ -123,7 +149,7 @@ export const ApplyAuthorPage: React.FC = () => {
                   Super Author Account Detected
                 </h3>
                 <p className="text-emerald-800 mt-0.5">
-                  You are connected with the root Super Author wallet. You have full administrative privileges to register documents and review Secondary Author applications.
+                  You are connected with the root Super Author wallet on MST Chain Testnet. You have full administrative privileges to review Secondary Author applications.
                 </p>
               </div>
             </div>
@@ -181,18 +207,19 @@ export const ApplyAuthorPage: React.FC = () => {
           </Card>
         )}
 
-        {/* Status: Application Pending Review */}
-        {existingApp && isPending && (
+        {/* Status: Application Pending Review (On-Chain Confirmed) */}
+        {existingApp && isPending && existingApp.isOnChain && existingApp.submissionTxHash && (
           <Card className="p-6 bg-amber-50/70 border border-amber-200 text-xs text-amber-900 space-y-4">
             <div className="flex items-center justify-between pb-3 border-b border-amber-200/60">
               <div className="flex items-center gap-2.5">
                 <Clock className="w-5 h-5 text-amber-600" />
                 <span className="font-bold text-amber-950 text-sm">
-                  Application Pending Review ({existingApp.id})
+                  Application Submitted on Blockchain ({existingApp.id})
                 </span>
               </div>
-              <span className="px-2 py-0.5 bg-amber-200/70 text-amber-950 rounded-full font-semibold font-mono text-[11px]">
-                Pending Super Author
+              <span className="px-2.5 py-1 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-full font-semibold font-mono text-[11px] flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                Confirmed On-Chain
               </span>
             </div>
             <div className="grid grid-cols-2 gap-3 text-xs">
@@ -212,10 +239,86 @@ export const ApplyAuthorPage: React.FC = () => {
                 <span className="text-amber-800/80 font-medium block">Submitted</span>
                 <span className="font-bold text-amber-950">{formatDate(existingApp.submittedAt)}</span>
               </div>
+              {existingApp.submissionBlockNumber && (
+                <div>
+                  <span className="text-amber-800/80 font-medium block">Block Number</span>
+                  <span className="font-bold font-mono text-amber-950">#{existingApp.submissionBlockNumber}</span>
+                </div>
+              )}
+              <div className="col-span-2">
+                <span className="text-amber-800/80 font-medium block mb-1">Blockchain Transaction Hash</span>
+                <a 
+                  href={`https://testnet.mstscan.com/tx/${existingApp.submissionTxHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-mono text-blue-700 bg-white/80 p-2 rounded-lg border border-amber-200 flex items-center justify-between hover:bg-white transition-colors"
+                >
+                  <span className="truncate mr-2">{existingApp.submissionTxHash}</span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                </a>
+              </div>
             </div>
             <p className="text-[11px] text-amber-800 leading-relaxed pt-1">
-              Your application has been received and is queued for verification by the Super Author. Once approved, your wallet address will automatically receive document registration permissions.
+              Your application has been confirmed on the MST Chain Testnet and is visible to the Super Author for credential review. Once approved, your wallet address will automatically receive document registration permissions.
             </p>
+          </Card>
+        )}
+
+        {/* Status: Local Draft / Not Submitted on Blockchain (The Reported Bug Recovery) */}
+        {existingApp && isPending && (!existingApp.isOnChain || !existingApp.submissionTxHash) && (
+          <Card className="p-6 bg-stone-50 border-2 border-dashed border-amber-300 text-xs text-stone-800 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-stone-200">
+              <div className="flex items-center gap-2.5">
+                <AlertTriangle className="w-5 h-5 text-amber-600" />
+                <span className="font-bold text-stone-900 text-sm">
+                  Application Draft Saved Locally ({existingApp.id})
+                </span>
+              </div>
+              <span className="px-2.5 py-1 bg-amber-100 text-amber-900 border border-amber-300 rounded-full font-semibold font-mono text-[11px]">
+                Not on Blockchain
+              </span>
+            </div>
+
+            <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 space-y-1">
+              <span className="font-bold block">Blockchain Submission Required:</span>
+              <p className="text-[11px] leading-relaxed">
+                This application draft exists only in your local browser storage. No transaction was confirmed on the MST Chain Testnet, which is why the Super Author cannot see or review it. Broadcast it now to record it on-chain.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 text-xs bg-white p-3 rounded-xl border border-stone-200">
+              <div>
+                <span className="text-stone-500 font-medium block">Applicant Name</span>
+                <span className="font-bold text-stone-900">{existingApp.applicantName}</span>
+              </div>
+              <div>
+                <span className="text-stone-500 font-medium block">Organization</span>
+                <span className="font-bold text-stone-900">{existingApp.organization}</span>
+              </div>
+            </div>
+
+            {submitError && (
+              <div className="p-3 bg-red-50 text-red-800 rounded-xl border border-red-200 text-xs flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <span>{submitError}</span>
+              </div>
+            )}
+
+            <div className="pt-2 flex items-center justify-between">
+              <span className="text-[11px] text-stone-500">
+                Network: MST Chain Testnet (91562037)
+              </span>
+              <Button
+                variant="primary-app"
+                size="md"
+                loading={isSubmitting}
+                disabled={walletStatus !== 'connected'}
+                onClick={handleBroadcastDraft}
+                icon={<UploadCloud className="w-4 h-4" />}
+              >
+                Broadcast to MST Testnet
+              </Button>
+            </div>
           </Card>
         )}
 
@@ -253,6 +356,16 @@ export const ApplyAuthorPage: React.FC = () => {
                   Provide verified notary or official land title registry credentials for authorization.
                 </p>
               </div>
+
+              {submitError && (
+                <div className="p-3 bg-red-50 text-red-800 rounded-xl border border-red-200 text-xs flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold block">Submission Failed</span>
+                    <span>{submitError}</span>
+                  </div>
+                </div>
+              )}
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Input
@@ -304,10 +417,10 @@ export const ApplyAuthorPage: React.FC = () => {
               <div className="p-4 bg-stone-50 rounded-2xl border border-black/5 text-xs text-stone-600 space-y-1">
                 <span className="font-bold text-stone-900 flex items-center gap-1.5">
                   <ShieldCheck className="w-4 h-4 text-stone-700" />
-                  <span>Credential Confidentiality Notice</span>
+                  <span>On-Chain Credential Notice</span>
                 </span>
                 <p className="text-[11px] leading-relaxed">
-                  Application credentials are strictly accessible to the Super Author for administrative review. Personal contact info is never exposed on public verification links or public blockchain remark logs.
+                  Submitting will request a signature from your connected wallet on MST Chain Testnet ({selectedNetwork}). Only after a confirmed block receipt will the application enter the Super Author review queue.
                 </p>
               </div>
 
@@ -329,7 +442,7 @@ export const ApplyAuthorPage: React.FC = () => {
                   disabled={walletStatus !== 'connected'}
                   icon={<Send className="w-4 h-4" />}
                 >
-                  Submit Application
+                  Submit Application on Blockchain
                 </Button>
               </div>
             </Card>

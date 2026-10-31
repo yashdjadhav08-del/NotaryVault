@@ -131,6 +131,19 @@ export async function sendEmailNotification(payload) {
   }
   console.log(`[Notification:Email] Recipient format validated: ${maskedRecipient}`);
 
+  // Validate attachment availability if attachment object passed
+  if (payload.attachment) {
+    if (!payload.attachment.content || (Buffer.isBuffer(payload.attachment.content) && payload.attachment.content.length === 0)) {
+      console.warn(`[Notification:Attachment] Attachment content is missing or empty for document "${payload.documentId}".`);
+      return {
+        success: false,
+        status: 'failed',
+        category: 'missing_attachment',
+        error: 'Original PDF attachment is unavailable or empty. Email delivery aborted to prevent sending incomplete documents.',
+      };
+    }
+  }
+
   // Attachment size check (25 MB provider limit)
   if (payload.attachment && payload.attachment.content) {
     const byteLength = Buffer.isBuffer(payload.attachment.content) 
@@ -142,6 +155,7 @@ export async function sendEmailNotification(payload) {
       return {
         success: false,
         status: 'failed',
+        category: 'attachment_too_large',
         error: `Attachment size (${(byteLength / 1024 / 1024).toFixed(1)} MB) exceeds the 25 MB provider email limit.`,
       };
     }
@@ -150,6 +164,7 @@ export async function sendEmailNotification(payload) {
   const appUrl = (payload.appBaseUrl || 'http://localhost:5173').replace(/\/$/, '');
   const verifyUrl = `${appUrl}/verify/${encodeURIComponent(payload.documentId)}`;
   const accessUrl = payload.secureAccessUrl || `${appUrl}/app/documents/${encodeURIComponent(payload.documentId)}`;
+  const isPermanentLink = Boolean(payload.secureAccessUrl);
 
   const subject = payload.subject || `NotaryVault: Secured Document "${payload.title}" (${payload.documentId})`;
   
@@ -171,11 +186,21 @@ export async function sendEmailNotification(payload) {
     payload.sha256Hash ? `SHA-256 Digest: ${payload.sha256Hash}` : '',
     payload.attachment ? `Attached: Original verified PDF document (${payload.attachment.filename || `${payload.documentId}.pdf`}).` : '',
     ``,
+    `----------------------------------------------------`,
+    isPermanentLink 
+      ? `YOUR PERMANENT PRIVATE DOCUMENT ACCESS LINK (NO EXPIRATION):`
+      : `SECURE ACCESS URL:`,
+    accessUrl,
+    isPermanentLink
+      ? `This permanent private link does not expire. You can use it in the future at any time to access and download your original PDF without contacting the author again.`
+      : '',
+    `----------------------------------------------------`,
+    ``,
     `Public Blockchain Verification:`,
     verifyUrl,
     ``,
-    `Secure Access URL:`,
-    accessUrl,
+    `LEGAL NOTICE:`,
+    `Possession of this private document access link enables confidential retrieval and download of the registered file, but does NOT constitute legal proof of property ownership or title. Do not assume that anyone possessing this link is necessarily the legal owner. Legal property ownership is established exclusively through lawful conveyance instruments and official governmental land registries.`,
     ``,
     `Integrity Note: This document's SHA-256 hash was cryptographically verified against the on-chain registry before transmission.`,
     ``,
@@ -217,8 +242,30 @@ export async function sendEmailNotification(payload) {
 
       ${payload.attachment ? `<div style="background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 12px; font-size: 12px; color: #065f46; margin-bottom: 18px;">📎 <strong>Attached:</strong> Original verified PDF document (<code>${escapeHtml(payload.attachment.filename || `${payload.documentId}.pdf`)}</code>).</div>` : ''}
 
-      <div style="margin: 22px 0; text-align: center;">
-        <a href="${verifyUrl}" style="background-color: #1F6FF0; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: bold; display: inline-block;">Verify on Public Blockchain</a>
+      ${isPermanentLink ? `
+      <div style="background: #f0f7ff; border: 1px solid #b9d9fe; border-radius: 10px; padding: 16px; margin: 18px 0;">
+        <div style="font-size: 14px; font-weight: bold; color: #1F6FF0; margin-bottom: 6px; display: flex; align-items: center; gap: 6px;">
+          <span>🔒 Permanent Private Document Access Link</span>
+        </div>
+        <p style="font-size: 12px; color: #334155; margin: 0 0 12px 0; line-height: 1.5;">
+          This link has <strong>NO EXPIRATION DATE</strong>. You can use it at any time in the future to access and download your original verified PDF file without needing to contact the author again.
+        </p>
+        <div style="text-align: center; margin: 14px 0 10px 0;">
+          <a href="${accessUrl}" style="background-color: #1F6FF0; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: bold; display: inline-block;">Access & Download Verified PDF</a>
+        </div>
+        <p style="font-size: 11px; font-family: monospace; word-break: break-all; color: #64748b; margin: 8px 0 0 0; background: #ffffff; padding: 8px; border-radius: 6px; border: 1px solid #e2e8f0;">
+          ${escapeHtml(accessUrl)}
+        </p>
+      </div>
+      ` : ''}
+
+      <div style="margin: 18px 0; text-align: center;">
+        <a href="${verifyUrl}" style="background-color: #334155; color: #ffffff; padding: 10px 20px; border-radius: 8px; text-decoration: none; font-size: 12px; font-weight: 600; display: inline-block;">Verify on Public Blockchain</a>
+      </div>
+
+      <!-- Legal Ownership Distinction Disclaimer -->
+      <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 12px; font-size: 11px; color: #92400e; margin: 20px 0 14px 0; line-height: 1.5;">
+        <strong>LEGAL NOTICE:</strong> Possession of this private document access link enables confidential retrieval and download of the registered file, but does <strong>NOT</strong> constitute legal proof of property ownership or title. Do not assume that anyone possessing this link is necessarily the legal owner. Official property ownership is established exclusively through lawful conveyance instruments and authoritative governmental registries.
       </div>
 
       <p style="font-size: 11px; color: #888; border-top: 1px solid #eee; padding-top: 14px; margin-top: 20px; text-align: center; line-height: 1.4;">
@@ -329,13 +376,16 @@ export async function sendEmailNotification(payload) {
 
       if (/only send testing emails to your own email address/i.test(rawError) || /testing restrictions/i.test(rawError)) {
         category = 'recipient_not_permitted';
-        safeError = "Recipient is not permitted by the provider's testing restrictions. Under Resend's free tier, emails can only be delivered to your verified Resend account owner email. To send to any recipient, verify your domain at resend.com/domains.";
+        safeError = "Recipient address is restricted by the email provider's testing tier. Resend free test keys can only send to your verified account owner email (yashdjzzz@gmail.com). To deliver to any external recipient, please verify your custom sender domain at resend.com/domains.";
+      } else if (/invalid `to` field/i.test(rawError) || /example\.com/i.test(rawError) || /testing email address instead of domains/i.test(rawError)) {
+        category = 'invalid_recipient_domain';
+        safeError = "Recipient email domain is reserved for examples (e.g. example.com). The provider requires an active, deliverable email address.";
       } else if (/domain is not verified/i.test(rawError) || /sender domain/i.test(rawError)) {
         category = 'sender_unverified';
-        safeError = "Sender address/domain is not verified. Please verify your custom domain in the Resend dashboard or configure a verified sender.";
+        safeError = "Sender domain is not verified with the email provider. Please verify your custom domain in the Resend dashboard or use the default test sender.";
       } else if (res.status === 401 || (res.status === 403 && /api key/i.test(rawError))) {
         category = 'invalid_credentials';
-        safeError = "Email provider authentication failed. Please verify your RESEND_API_KEY.";
+        safeError = "Email provider authentication failed. Please verify that your RESEND_API_KEY in .env is valid.";
       } else if (res.status === 429) {
         category = 'rate_limited';
         safeError = "Email provider rate limit reached. Please wait a moment before retrying.";
@@ -515,6 +565,7 @@ export async function dispatchOwnerNotifications(params) {
       blockNumber: params.blockNumber,
       networkName: params.networkName,
       appBaseUrl: params.appBaseUrl,
+      secureAccessUrl: params.secureAccessUrl,
     });
     result.email = {
       status: emailRes.status,

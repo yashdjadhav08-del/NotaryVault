@@ -10,7 +10,7 @@ export const LandingNav: React.FC = () => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   return (
-    <header className="sticky top-0 z-40 w-full bg-[#F7F4ED]/90 backdrop-blur-md transition-all">
+    <header className="sticky top-0 z-40 w-full bg-[#F7F4ED] border-b border-stone-200/80 shadow-xs transition-all">
       <div className="max-w-[1660px] mx-auto px-6 md:px-12 lg:px-20 h-20 md:h-24 flex items-center justify-between">
         
         {/* Left: Brand Logo & Wordmark */}
@@ -153,7 +153,7 @@ export const LandingNav: React.FC = () => {
 
       {/* Mobile Drawer */}
       {mobileMenuOpen && (
-        <div className="lg:hidden bg-white/95 backdrop-blur-xl border-b border-black/10 px-6 py-6 space-y-4">
+        <div className="lg:hidden bg-white border-b border-black/10 px-6 py-6 space-y-4">
           <div className="flex flex-col gap-3 font-medium text-[#1C1C1C]">
             <Link to="/app" onClick={() => setMobileMenuOpen(false)} className="py-2 text-lg font-semibold">
               Dashboard

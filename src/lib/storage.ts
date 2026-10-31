@@ -6,38 +6,91 @@ import type {
   AuthorizedAuthorRecord 
 } from '../types';
 
+export type SupportedNetworkKey = 'testnet' | 'mainnet';
+
+export function normalizeNetworkKey(networkKey?: string): SupportedNetworkKey {
+  return networkKey?.toLowerCase() === 'mainnet' ? 'mainnet' : 'testnet';
+}
+
 const STORAGE_KEYS = {
-  DOCUMENTS: 'notaryvault_documents_v1',
-  SHARED: 'notaryvault_shared_v1',
-  ACTIVITIES: 'notaryvault_activities_v1',
-  APPLICATIONS: 'notaryvault_author_applications_v1',
-  AUTHORS: 'notaryvault_authorized_authors_v1',
+  LEGACY_DOCUMENTS: 'notaryvault_documents_v1',
+  LEGACY_SHARED: 'notaryvault_shared_v1',
+  LEGACY_ACTIVITIES: 'notaryvault_activities_v1',
+  LEGACY_APPLICATIONS: 'notaryvault_author_applications_v1',
+  LEGACY_AUTHORS: 'notaryvault_authorized_authors_v1',
+  DOCUMENTS_PREFIX: 'notaryvault_documents_',
+  SHARED_PREFIX: 'notaryvault_shared_',
+  ACTIVITIES_PREFIX: 'notaryvault_activities_',
+  APPLICATIONS_PREFIX: 'notaryvault_applications_',
+  AUTHORS_PREFIX: 'notaryvault_authors_',
   BACKUP_PREFIX: 'notaryvault_backup_',
 };
 
 /**
- * Loads documents from localStorage with schema validation and fallback checks.
+ * Returns the network-partitioned storage key.
+ */
+export function getStorageKeyForNetwork(prefix: string, networkKey?: string): string {
+  const net = normalizeNetworkKey(networkKey);
+  return `${prefix}${net}`;
+}
+
+/**
+ * Loads documents from localStorage with strict network partitioning and schema validation.
  */
 export function loadDocuments(networkKey?: string): DocumentRecord[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEYS.DOCUMENTS);
-    let docs: DocumentRecord[] = raw ? JSON.parse(raw) : [];
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.DOCUMENTS_PREFIX, net);
+    const raw = localStorage.getItem(key);
 
-    // Fallback: check network-specific backup if primary is empty
-    if (docs.length === 0 && networkKey) {
-      const backupRaw = localStorage.getItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_${networkKey}`);
-      if (backupRaw) {
-        docs = JSON.parse(backupRaw);
+    let docs: DocumentRecord[] = [];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) docs = parsed;
+      } catch {}
+    }
+
+    // Backward-compatibility fallback:
+    if (docs.length === 0) {
+      if (net === 'testnet') {
+        // Check legacy single-bucket storage
+        const legacyRaw = localStorage.getItem(STORAGE_KEYS.LEGACY_DOCUMENTS);
+        if (legacyRaw) {
+          try {
+            const legacyParsed = JSON.parse(legacyRaw);
+            if (Array.isArray(legacyParsed)) {
+              docs = legacyParsed.filter(d => !d.networkKey || d.networkKey === 'testnet');
+            }
+          } catch {}
+        }
+        // Check backup
+        if (docs.length === 0) {
+          const backupRaw = localStorage.getItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_testnet`);
+          if (backupRaw) {
+            try {
+              const bParsed = JSON.parse(backupRaw);
+              if (Array.isArray(bParsed)) docs = bParsed;
+            } catch {}
+          }
+        }
+      } else if (net === 'mainnet') {
+        const backupRaw = localStorage.getItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_mainnet`);
+        if (backupRaw) {
+          try {
+            const bParsed = JSON.parse(backupRaw);
+            if (Array.isArray(bParsed)) docs = bParsed;
+          } catch {}
+        }
       }
     }
 
     if (!Array.isArray(docs)) return [];
 
-    // Filter by network if specified
-    if (networkKey) {
-      return docs.filter(d => !d.networkKey || d.networkKey === networkKey);
-    }
-    return docs;
+    // Strictly enforce that returned documents match the requested network
+    return docs
+      .filter(d => (d.networkKey || 'testnet').toLowerCase() === net)
+      .map(d => ({ ...d, networkKey: net }));
   } catch (e) {
     console.error('Error loading documents from localStorage', e);
     return [];
@@ -45,31 +98,29 @@ export function loadDocuments(networkKey?: string): DocumentRecord[] {
 }
 
 /**
- * Saves documents to localStorage with automatic backup.
+ * Saves documents to localStorage partitioned strictly by network.
  */
-export function saveDocuments(docs: DocumentRecord[]): void {
+export function saveDocuments(docs: DocumentRecord[], networkKey?: string): void {
   try {
     if (!Array.isArray(docs)) return;
-    localStorage.setItem(STORAGE_KEYS.DOCUMENTS, JSON.stringify(docs));
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.DOCUMENTS_PREFIX, net);
 
-    // Also persist per-network backups so switching networks or partial clears don't lose data
-    const testnetDocs = docs.filter(d => !d.networkKey || d.networkKey === 'testnet');
-    const mainnetDocs = docs.filter(d => d.networkKey === 'mainnet');
+    // Save only documents belonging to this network
+    const networkDocs = docs.filter(d => (d.networkKey || 'testnet').toLowerCase() === net);
+    localStorage.setItem(key, JSON.stringify(networkDocs));
 
-    if (testnetDocs.length > 0) {
-      localStorage.setItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_testnet`, JSON.stringify(testnetDocs));
-    }
-    if (mainnetDocs.length > 0) {
-      localStorage.setItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_mainnet`, JSON.stringify(mainnetDocs));
-    }
+    // Also persist per-network backup
+    localStorage.setItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_${net}`, JSON.stringify(networkDocs));
   } catch (e) {
     console.error('Error saving documents to localStorage', e);
   }
 }
 
 /**
- * Merges local and recovered document records without data loss or duplicates.
- * Preserves user-provided titles, files, and notes while updating on-chain confirmation details.
+ * Merges local and recovered document records without cross-network data leakage.
+ * Uses a composite key `${networkKey}:${docId}` so the same Document ID can exist
+ * independently on Testnet and Mainnet without overwriting each other.
  */
 export function mergeDocuments(
   existingDocs: DocumentRecord[],
@@ -77,22 +128,29 @@ export function mergeDocuments(
 ): DocumentRecord[] {
   const map = new Map<string, DocumentRecord>();
 
+  // Helper to build composite deduplication key
+  const getCompositeKey = (doc: DocumentRecord) => {
+    const net = (doc.networkKey || 'testnet').toLowerCase();
+    const id = doc.id ? doc.id.trim().toUpperCase() : '';
+    return `${net}:${id}`;
+  };
+
   // 1. Index existing documents
   for (const doc of existingDocs) {
     if (doc && doc.id) {
-      map.set(doc.id.toUpperCase(), doc);
+      map.set(getCompositeKey(doc), doc);
     }
   }
 
   // 2. Merge incoming documents
   for (const incoming of incomingDocs) {
     if (!incoming || !incoming.id) continue;
-    const cleanId = incoming.id.toUpperCase();
-    const existing = map.get(cleanId);
+    const key = getCompositeKey(incoming);
+    const existing = map.get(key);
 
     if (existing) {
       // Merge: preserve local metadata, update verified on-chain data
-      map.set(cleanId, {
+      map.set(key, {
         ...existing,
         ...incoming,
         name: existing.name || incoming.name,
@@ -111,12 +169,13 @@ export function mergeDocuments(
         contractAddress: incoming.contractAddress || existing.contractAddress,
         networkChainId: incoming.networkChainId || existing.networkChainId,
         networkKey: incoming.networkKey || existing.networkKey,
+        networkName: incoming.networkName || existing.networkName,
         onChainStatus: incoming.onChainStatus || existing.onChainStatus,
         registrantAddress: incoming.registrantAddress || existing.registrantAddress,
         status: incoming.onChainStatus === 'revoked' ? 'Hash Mismatch' : (incoming.status || existing.status),
       });
     } else {
-      map.set(cleanId, incoming);
+      map.set(key, incoming);
     }
   }
 
@@ -126,22 +185,36 @@ export function mergeDocuments(
   );
 }
 
-export function loadSharedRecords(): SharedRecord[] {
+export function loadSharedRecords(networkKey?: string): SharedRecord[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEYS.SHARED);
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.SHARED_PREFIX, net);
+    let raw = localStorage.getItem(key);
+
+    if (!raw && net === 'testnet') {
+      raw = localStorage.getItem(STORAGE_KEYS.LEGACY_SHARED);
+    }
+
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter(r => !r.networkKey || (r.networkKey as string).toLowerCase() === net)
+      .map(r => ({ ...r, networkKey: net }));
   } catch (e) {
     console.error('Error loading shared records', e);
     return [];
   }
 }
 
-export function saveSharedRecords(records: SharedRecord[]): void {
+export function saveSharedRecords(records: SharedRecord[], networkKey?: string): void {
   try {
     if (!Array.isArray(records)) return;
-    localStorage.setItem(STORAGE_KEYS.SHARED, JSON.stringify(records));
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.SHARED_PREFIX, net);
+    const networkRecords = records.filter(r => !r.networkKey || (r.networkKey as string).toLowerCase() === net);
+    localStorage.setItem(key, JSON.stringify(networkRecords));
   } catch (e) {
     console.error('Error saving shared records', e);
   }
@@ -149,35 +222,75 @@ export function saveSharedRecords(records: SharedRecord[]): void {
 
 export function loadActivities(networkKey?: string): ActivityEvent[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEYS.ACTIVITIES);
-    let events: ActivityEvent[] = raw ? JSON.parse(raw) : [];
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.ACTIVITIES_PREFIX, net);
+    let raw = localStorage.getItem(key);
 
-    if (events.length === 0 && networkKey) {
-      const backupRaw = localStorage.getItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_${networkKey}`);
-      if (backupRaw) {
-        events = JSON.parse(backupRaw);
+    let events: ActivityEvent[] = [];
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) events = parsed;
+      } catch {}
+    }
+
+    if (events.length === 0) {
+      if (net === 'testnet') {
+        const legacyRaw = localStorage.getItem(STORAGE_KEYS.LEGACY_ACTIVITIES);
+        if (legacyRaw) {
+          try {
+            const parsed = JSON.parse(legacyRaw);
+            if (Array.isArray(parsed)) {
+              events = parsed.filter(a => !a.networkKey || a.networkKey === 'testnet');
+            }
+          } catch {}
+        }
+        if (events.length === 0) {
+          const backupRaw = localStorage.getItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_testnet`);
+          if (backupRaw) {
+            try {
+              const bParsed = JSON.parse(backupRaw);
+              if (Array.isArray(bParsed)) events = bParsed;
+            } catch {}
+          }
+        }
+      } else if (net === 'mainnet') {
+        const backupRaw = localStorage.getItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_mainnet`);
+        if (backupRaw) {
+          try {
+            const bParsed = JSON.parse(backupRaw);
+            if (Array.isArray(bParsed)) events = bParsed;
+          } catch {}
+        }
       }
     }
 
-    return Array.isArray(events) ? events : [];
+    return events
+      .filter(a => !a.networkKey || (a.networkKey as string).toLowerCase() === net)
+      .map(a => ({ ...a, networkKey: net }));
   } catch (e) {
     console.error('Error loading activities', e);
     return [];
   }
 }
 
-export function saveActivities(events: ActivityEvent[]): void {
+export function saveActivities(events: ActivityEvent[], networkKey?: string): void {
   try {
     if (!Array.isArray(events)) return;
-    localStorage.setItem(STORAGE_KEYS.ACTIVITIES, JSON.stringify(events));
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.ACTIVITIES_PREFIX, net);
+    const networkEvents = events.filter(a => !a.networkKey || (a.networkKey as string).toLowerCase() === net);
+    localStorage.setItem(key, JSON.stringify(networkEvents));
+
+    // Also persist per-network backup
+    localStorage.setItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_${net}`, JSON.stringify(networkEvents));
   } catch (e) {
     console.error('Error saving activities', e);
   }
 }
 
 /**
- * Merges activity records while strictly preventing duplicate entries.
- * Deduplicates by unique activity ID, or by combination of (documentId + type + timestamp).
+ * Merges activity records while strictly preventing duplicate entries and cross-network mixing.
  */
 export function mergeActivities(
   existingActivities: ActivityEvent[],
@@ -189,17 +302,19 @@ export function mergeActivities(
 
   const addUnique = (act: ActivityEvent) => {
     if (!act || !act.id) return;
-    if (seenIds.has(act.id)) return;
+    const net = (act.networkKey || 'testnet').toLowerCase();
+    const idKey = `${net}:${act.id}`;
+    if (seenIds.has(idKey)) return;
 
-    // Secondary fingerprint: documentId + type + normalized timestamp/day
+    // Secondary fingerprint: network + documentId + type + normalized timestamp
     const dateKey = act.timestamp ? act.timestamp.slice(0, 19) : '';
-    const fingerprint = `${act.documentId || ''}|${act.type}|${dateKey}`;
+    const fingerprint = `${net}|${act.documentId || ''}|${act.type}|${dateKey}`;
 
     if (seenFingerprints.has(fingerprint)) return;
 
-    seenIds.add(act.id);
+    seenIds.add(idKey);
     seenFingerprints.add(fingerprint);
-    result.push(act);
+    result.push({ ...act, networkKey: net as SupportedNetworkKey });
   };
 
   // 1. Add existing
@@ -218,17 +333,33 @@ export function mergeActivities(
   );
 }
 
-export function clearStoredData(): void {
+export function clearStoredData(networkKey?: string): void {
   try {
-    localStorage.removeItem(STORAGE_KEYS.DOCUMENTS);
-    localStorage.removeItem(STORAGE_KEYS.SHARED);
-    localStorage.removeItem(STORAGE_KEYS.ACTIVITIES);
-    localStorage.removeItem(STORAGE_KEYS.APPLICATIONS);
-    localStorage.removeItem(STORAGE_KEYS.AUTHORS);
-    localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_testnet`);
-    localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_mainnet`);
-    localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_testnet`);
-    localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_mainnet`);
+    if (networkKey) {
+      const net = normalizeNetworkKey(networkKey);
+      localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.DOCUMENTS_PREFIX, net));
+      localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.SHARED_PREFIX, net));
+      localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.ACTIVITIES_PREFIX, net));
+      localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.APPLICATIONS_PREFIX, net));
+      localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.AUTHORS_PREFIX, net));
+      localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_${net}`);
+      localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_${net}`);
+    } else {
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_DOCUMENTS);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_SHARED);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_ACTIVITIES);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_APPLICATIONS);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_AUTHORS);
+      for (const net of ['testnet', 'mainnet'] as const) {
+        localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.DOCUMENTS_PREFIX, net));
+        localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.SHARED_PREFIX, net));
+        localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.ACTIVITIES_PREFIX, net));
+        localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.APPLICATIONS_PREFIX, net));
+        localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.AUTHORS_PREFIX, net));
+        localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}docs_${net}`);
+        localStorage.removeItem(`${STORAGE_KEYS.BACKUP_PREFIX}acts_${net}`);
+      }
+    }
   } catch (e) {
     console.error('Error clearing stored data', e);
   }
@@ -237,51 +368,102 @@ export function clearStoredData(): void {
 export const resetDemoData = clearStoredData;
 
 /**
- * Loads author applications from localStorage.
+ * Loads author applications from localStorage partitioned by network.
  */
-export function loadAuthorApplications(): AuthorApplication[] {
+export function loadAuthorApplications(networkKey?: string): AuthorApplication[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEYS.APPLICATIONS);
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.APPLICATIONS_PREFIX, net);
+    let raw = localStorage.getItem(key);
+
+    if (!raw && net === 'testnet') {
+      raw = localStorage.getItem(STORAGE_KEYS.LEGACY_APPLICATIONS);
+    }
+
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter(a => !a.networkKey || (a.networkKey as string).toLowerCase() === net)
+      .map(a => ({ ...a, networkKey: net }));
   } catch {
     return [];
   }
 }
 
 /**
- * Saves author applications to localStorage.
+ * Saves author applications to localStorage partitioned by network.
  */
-export function saveAuthorApplications(apps: AuthorApplication[]): void {
+export function saveAuthorApplications(apps: AuthorApplication[], networkKey?: string): void {
   try {
-    localStorage.setItem(STORAGE_KEYS.APPLICATIONS, JSON.stringify(apps));
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.APPLICATIONS_PREFIX, net);
+    const networkApps = apps.filter(a => !a.networkKey || (a.networkKey as string).toLowerCase() === net);
+    localStorage.setItem(key, JSON.stringify(networkApps));
   } catch (e) {
     console.error('Error saving author applications', e);
   }
 }
 
 /**
- * Loads authorized authors from localStorage.
+ * Loads authorized authors from localStorage partitioned by network.
  */
-export function loadAuthorizedAuthors(): AuthorizedAuthorRecord[] {
+export function loadAuthorizedAuthors(networkKey?: string): AuthorizedAuthorRecord[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEYS.AUTHORS);
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.AUTHORS_PREFIX, net);
+    let raw = localStorage.getItem(key);
+
+    if (!raw && net === 'testnet') {
+      raw = localStorage.getItem(STORAGE_KEYS.LEGACY_AUTHORS);
+    }
+
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter(a => !a.networkKey || (a.networkKey as string).toLowerCase() === net)
+      .map(a => ({ ...a, networkKey: net }));
   } catch {
     return [];
   }
 }
 
 /**
- * Saves authorized authors to localStorage.
+ * Saves authorized authors to localStorage partitioned by network.
  */
-export function saveAuthorizedAuthors(authors: AuthorizedAuthorRecord[]): void {
+export function saveAuthorizedAuthors(authors: AuthorizedAuthorRecord[], networkKey?: string): void {
   try {
-    localStorage.setItem(STORAGE_KEYS.AUTHORS, JSON.stringify(authors));
+    const net = normalizeNetworkKey(networkKey);
+    const key = getStorageKeyForNetwork(STORAGE_KEYS.AUTHORS_PREFIX, net);
+    const networkAuthors = authors.filter(a => !a.networkKey || (a.networkKey as string).toLowerCase() === net);
+    localStorage.setItem(key, JSON.stringify(networkAuthors));
   } catch (e) {
     console.error('Error saving authorized authors', e);
+  }
+}
+
+/**
+ * Clears all stored records for a specific network.
+ */
+export function clearNetworkRecords(networkKey?: string): void {
+  try {
+    const net = normalizeNetworkKey(networkKey);
+    localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.DOCUMENTS_PREFIX, net));
+    localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.SHARED_PREFIX, net));
+    localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.ACTIVITIES_PREFIX, net));
+    localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.APPLICATIONS_PREFIX, net));
+    localStorage.removeItem(getStorageKeyForNetwork(STORAGE_KEYS.AUTHORS_PREFIX, net));
+    if (net === 'testnet') {
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_DOCUMENTS);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_SHARED);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_ACTIVITIES);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_APPLICATIONS);
+      localStorage.removeItem(STORAGE_KEYS.LEGACY_AUTHORS);
+    }
+  } catch (e) {
+    console.error('Error clearing network records', e);
   }
 }

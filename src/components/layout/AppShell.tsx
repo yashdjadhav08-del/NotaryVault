@@ -48,6 +48,16 @@ export const AppShell: React.FC<AppShellProps> = ({
   } = useWallet();
   const { pendingApplicationsCount } = useAuthors();
 
+  React.useEffect(() => {
+    if (mobileDrawerOpen) {
+      const prevOverflow = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+      return () => {
+        document.body.style.overflow = prevOverflow;
+      };
+    }
+  }, [mobileDrawerOpen]);
+
   const mainNavItems = [
     { label: 'Dashboard', path: '/app', icon: <LayoutDashboard className="w-4 h-4" /> },
     { label: 'Documents', path: '/app/documents', icon: <FileText className="w-4 h-4" /> },
@@ -57,6 +67,12 @@ export const AppShell: React.FC<AppShellProps> = ({
     { label: 'Activity', path: '/app/activity', icon: <Clock className="w-4 h-4" /> },
     { label: 'Settings', path: '/app/settings', icon: <Settings className="w-4 h-4" /> },
   ];
+
+  const visibleNavItems = mainNavItems.filter(item => {
+    if (item.path === '/app/register') return isAuthor;
+    if (item.path === '/app/shared') return isAuthor;
+    return true;
+  });
 
   const isActive = (path: string) => {
     if (path === '/app') {
@@ -109,7 +125,7 @@ export const AppShell: React.FC<AppShellProps> = ({
               MAIN
             </div>
             <nav className="space-y-1">
-              {mainNavItems.map(item => {
+              {visibleNavItems.map(item => {
                 const active = isActive(item.path);
                 return (
                   <Link
@@ -162,20 +178,22 @@ export const AppShell: React.FC<AppShellProps> = ({
                 </Link>
               )}
 
-              <Link
-                to="/app/authors"
-                onClick={() => setMobileDrawerOpen(false)}
-                className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors ${
-                  isActive('/app/authors')
-                    ? 'bg-[#152238] text-white shadow-sm font-semibold'
-                    : 'text-stone-300 hover:text-white hover:bg-white/5'
-                }`}
-              >
-                <span className={isActive('/app/authors') ? 'text-[#1F6FF0]' : 'text-stone-400'}>
-                  <Users className="w-4 h-4" />
-                </span>
-                <span>Author Directory</span>
-              </Link>
+              {isAuthor && (
+                <Link
+                  to="/app/authors"
+                  onClick={() => setMobileDrawerOpen(false)}
+                  className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors ${
+                    isActive('/app/authors')
+                      ? 'bg-[#152238] text-white shadow-sm font-semibold'
+                      : 'text-stone-300 hover:text-white hover:bg-white/5'
+                  }`}
+                >
+                  <span className={isActive('/app/authors') ? 'text-[#1F6FF0]' : 'text-stone-400'}>
+                    <Users className="w-4 h-4" />
+                  </span>
+                  <span>Author Directory</span>
+                </Link>
+              )}
 
               {!isAuthor && (
                 <Link
@@ -234,7 +252,7 @@ export const AppShell: React.FC<AppShellProps> = ({
       {mobileDrawerOpen && (
         <div className="lg:hidden fixed inset-0 z-50 flex">
           <div 
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm"
+            className="fixed inset-0 bg-black/60"
             onClick={() => setMobileDrawerOpen(false)}
           />
           <div className="relative w-[280px] max-w-[80vw] h-full z-10">
@@ -244,16 +262,16 @@ export const AppShell: React.FC<AppShellProps> = ({
       )}
 
       {/* Main Content Area */}
-      <div className="flex-1 lg:pl-[260px] flex flex-col min-h-screen">
+      <div className="flex-1 lg:pl-[260px] flex flex-col min-h-screen min-w-0">
         
         {/* Top Header Bar */}
-        <header className="sticky top-0 z-20 bg-white/95 backdrop-blur-md border-b border-black/[0.06] px-6 lg:px-10 py-3.5 flex items-center justify-between gap-4">
+        <header className="sticky top-0 z-20 bg-white border-b border-stone-200/90 shadow-xs px-4 sm:px-6 lg:px-10 py-3 sm:py-3.5 flex items-center justify-between gap-3 sm:gap-4 min-w-0">
           
-          <div className="flex items-center gap-4 min-w-0">
+          <div className="flex items-center gap-3 sm:gap-4 min-w-0 shrink">
             {/* Hamburger on mobile */}
             <button
               onClick={() => setMobileDrawerOpen(true)}
-              className="lg:hidden p-2 rounded-xl border border-black/10 text-stone-700 hover:bg-stone-50"
+              className="lg:hidden p-2 rounded-xl border border-black/10 text-stone-700 hover:bg-stone-50 shrink-0"
               aria-label="Open sidebar menu"
             >
               <Menu className="w-5 h-5" />
@@ -263,25 +281,25 @@ export const AppShell: React.FC<AppShellProps> = ({
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 text-xs text-stone-400 font-medium">
                 <Link to="/app" className="hover:text-stone-700">App</Link>
-                <ChevronRight className="w-3 h-3" />
+                <ChevronRight className="w-3 h-3 shrink-0" />
                 <span className="text-stone-700 truncate">{title}</span>
               </div>
-              <h1 className="text-xl md:text-2xl font-bold tracking-tight text-[#1C1C1C] truncate">
+              <h1 className="text-lg sm:text-xl md:text-2xl font-bold tracking-tight text-[#1C1C1C] truncate">
                 {title}
               </h1>
             </div>
           </div>
 
-          {/* Header Actions: Network Switcher + Wallet */}
-          <div className="flex items-center gap-3 shrink-0">
+          {/* Header Actions: Network Switcher + Role + Wallet */}
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
             {actions}
 
             {/* Explicit Network Selector */}
-            <div className="inline-flex items-center p-1 bg-stone-100 rounded-xl border border-black/5 text-xs font-semibold">
+            <div className="inline-flex items-center p-0.5 sm:p-1 bg-stone-100 rounded-xl border border-black/5 text-xs font-semibold shrink-0">
               <button
                 type="button"
                 onClick={() => setSelectedNetwork('testnet')}
-                className={`px-2.5 py-1 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
                   selectedNetwork === 'testnet'
                     ? 'bg-white text-blue-700 shadow-xs border border-black/5'
                     : 'text-stone-500 hover:text-stone-800'
@@ -289,13 +307,14 @@ export const AppShell: React.FC<AppShellProps> = ({
                 title="Select MST Chain Testnet (Chain ID 91562037)"
               >
                 <span className={`w-1.5 h-1.5 rounded-full ${selectedNetwork === 'testnet' ? 'bg-blue-600' : 'bg-stone-400'}`} />
-                <span>Testnet</span>
+                <span className="hidden xs:inline sm:inline">Testnet</span>
+                <span className="xs:hidden sm:hidden text-[10px]">Test</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setSelectedNetwork('mainnet')}
-                className={`px-2.5 py-1 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+                className={`px-2 sm:px-2.5 py-1 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
                   selectedNetwork === 'mainnet'
                     ? 'bg-purple-600 text-white shadow-xs'
                     : 'text-stone-500 hover:text-stone-800'
@@ -303,13 +322,14 @@ export const AppShell: React.FC<AppShellProps> = ({
                 title="Select MST Chain Mainnet (Chain ID 4646)"
               >
                 <span className={`w-1.5 h-1.5 rounded-full ${selectedNetwork === 'mainnet' ? 'bg-white' : 'bg-stone-400'}`} />
-                <span>Mainnet</span>
+                <span className="hidden xs:inline sm:inline">Mainnet</span>
+                <span className="xs:hidden sm:hidden text-[10px]">Main</span>
               </button>
             </div>
 
             {/* Connected Role Badge */}
             {walletStatus === 'connected' && (
-              <div className="hidden sm:flex items-center">
+              <div className="hidden md:flex items-center shrink-0">
                 {isSuperAuthor ? (
                   <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-50 text-amber-900 border border-amber-200 flex items-center gap-1.5 shadow-2xs">
                     <Crown className="w-3.5 h-3.5 text-amber-600" />
@@ -332,15 +352,17 @@ export const AppShell: React.FC<AppShellProps> = ({
               </div>
             )}
 
-            <WalletButton />
+            <div className="shrink-0">
+              <WalletButton />
+            </div>
           </div>
         </header>
 
         {/* Subtitle / Context Bar if provided */}
         {subtitle && (
-          <div className="bg-[#FCFBF8] border-b border-black/[0.04] px-6 lg:px-10 py-3 text-xs md:text-sm text-stone-600 flex items-center justify-between">
-            <span>{subtitle}</span>
-            <div className="flex items-center gap-3 font-mono text-[11px] text-stone-400">
+          <div className="bg-[#FCFBF8] border-b border-stone-200/70 px-4 sm:px-6 lg:px-10 py-2.5 sm:py-3 text-xs md:text-sm text-stone-600 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <span className="min-w-0">{subtitle}</span>
+            <div className="flex items-center gap-3 font-mono text-[11px] text-stone-400 shrink-0">
               <span className="hidden sm:inline">Client Cryptography: WebCrypto SHA-256</span>
               <span className="hidden md:inline">•</span>
               <span className="hidden md:inline flex items-center gap-1 text-stone-500">

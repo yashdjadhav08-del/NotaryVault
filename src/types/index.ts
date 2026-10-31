@@ -44,6 +44,7 @@ export interface DocumentRecord {
   contractAddress?: string;
   networkChainId?: string;
   networkKey?: 'testnet' | 'mainnet';
+  networkName?: string;
   onChainStatus?: 'unregistered' | 'registered' | 'revoked';
   registrantAddress?: string;
   ownerEmail?: string;
@@ -61,6 +62,7 @@ export interface SharedRecord {
   expiresAt: string;
   status: AccessStatus;
   accessCount: number;
+  networkKey?: 'testnet' | 'mainnet';
 }
 
 export type AuthorRole = 'super_author' | 'secondary_author' | 'public_user';
@@ -81,8 +83,11 @@ export interface AuthorApplication {
   reviewedBy?: string;
   reviewNotes?: string;
   approvalTxHash?: string;
+  approvalBlockNumber?: number;
   submissionTxHash?: string;
+  submissionBlockNumber?: number;
   networkKey?: 'testnet' | 'mainnet';
+  isOnChain?: boolean;
 }
 
 export interface AuthorizedAuthorRecord {
@@ -118,6 +123,13 @@ export interface ActivityEvent {
   documentId?: string;
   timestamp: string;
   status: 'success' | 'warning' | 'error' | 'info';
+  txHash?: string;
+  blockNumber?: number;
+  networkKey?: 'testnet' | 'mainnet';
+  networkName?: string;
+  chainId?: string;
+  contractAddress?: string;
+  isOnChain?: boolean;
 }
 
 export interface VerificationCheckResult {

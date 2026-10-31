@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AppShell } from '../components/layout/AppShell';
 import { Card } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
@@ -19,8 +20,10 @@ import {
 } from 'lucide-react';
 
 export const AuthorManagementPage: React.FC = () => {
+  const navigate = useNavigate();
   const { 
     isSuperAuthor, 
+    isAuthor,
     contractAdminAddress, 
     provider, 
     selectedNetwork 
@@ -49,6 +52,45 @@ export const AuthorManagementPage: React.FC = () => {
   };
 
   const superAuthorAddress = contractAdminAddress || '0x6D9618b1Ee522d22f3C168B40A33466A89af00C4';
+
+  if (!isAuthor) {
+    return (
+      <AppShell
+        title="Author Directory & Management"
+        subtitle="Authorized notary registries, Super Author authority, and Secondary Author permissions."
+      >
+        <div className="max-w-2xl mx-auto py-12">
+          <Card className="p-8 text-center flex flex-col items-center justify-center space-y-4">
+            <div className="w-14 h-14 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center">
+              <AlertTriangle className="w-7 h-7" />
+            </div>
+            <div className="space-y-2">
+              <h3 className="text-lg font-bold text-stone-900">Author Directory Access Restricted</h3>
+              <p className="text-xs text-stone-500 leading-relaxed max-w-md">
+                Viewing authorized notary directories and registry authorities is restricted to verified authors. Public Users can apply for Secondary Author status.
+              </p>
+            </div>
+            <div className="flex items-center gap-3 pt-2">
+              <Button
+                variant="primary-app"
+                size="md"
+                onClick={() => navigate('/app/apply-author')}
+              >
+                Apply to Become an Author
+              </Button>
+              <Button
+                variant="secondary"
+                size="md"
+                onClick={() => navigate('/app')}
+              >
+                Return to Dashboard
+              </Button>
+            </div>
+          </Card>
+        </div>
+      </AppShell>
+    );
+  }
 
   return (
     <AppShell

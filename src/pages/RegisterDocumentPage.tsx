@@ -23,6 +23,7 @@ import {
   Copy, 
   Check, 
   ShieldCheck, 
+  ShieldAlert,
   Info,
   ExternalLink,
   AlertTriangle,
@@ -142,7 +143,6 @@ export const RegisterDocumentPage: React.FC = () => {
                 return copy;
               });
             }
-            setIsGeneratingId(false);
           }
         }
       })
@@ -151,6 +151,10 @@ export const RegisterDocumentPage: React.FC = () => {
           const fallback = generateDocumentId();
           setDocumentId(fallback);
           setIdCheckStatus({ available: true });
+        }
+      })
+      .finally(() => {
+        if (active && seq === idValidationSeqRef.current) {
           setIsGeneratingId(false);
         }
       });
@@ -234,18 +238,17 @@ export const RegisterDocumentPage: React.FC = () => {
           return copy;
         });
       }
-    } catch {
+    } catch (err: any) {
       if (seq !== idValidationSeqRef.current) return;
-      // RPC or network failure — show verification warning, never falsely claim duplicate
+      const errMsg = err?.message || 'Could not verify Document ID because the RPC request failed. Please retry.';
       setIdCheckStatus({
-        available: true,
-        warning: 'Could not verify Document ID because the RPC request failed. Please retry.',
+        available: false,
+        error: errMsg,
       });
-      setErrors(prev => {
-        const copy = { ...prev };
-        delete copy.documentId;
-        return copy;
-      });
+      setErrors(prev => ({
+        ...prev,
+        documentId: errMsg,
+      }));
     } finally {
       if (seq === idValidationSeqRef.current) {
         setIdChecking(false);
@@ -363,6 +366,26 @@ export const RegisterDocumentPage: React.FC = () => {
   };
 
   const executeRegistration = async () => {
+    if (!isAuthor) {
+      addToast('Author Access Required', 'Only authorized authors can register documents on-chain.', 'error');
+      return;
+    }
+    if (walletStatus === 'connected' && !isCorrectNetwork) {
+      addToast(
+        'Network Mismatch',
+        `Wallet is connected to the wrong network. Please switch to ${activeNetworkConfig.name} in your wallet before proceeding.`,
+        'error'
+      );
+      return;
+    }
+    if (selectedNetwork === 'mainnet' && !isContractConfigured('mainnet')) {
+      addToast(
+        'Mainnet Contract Not Configured',
+        'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED. Mainnet transactions cannot be submitted.',
+        'error'
+      );
+      return;
+    }
     if (!file) return;
     setIsSubmitting(true);
     setHashingProgress('Validating PDF & computing SHA-256 digest from exact bytes...');
@@ -377,6 +400,7 @@ export const RegisterDocumentPage: React.FC = () => {
         type,
         description: description.trim(),
         owner: owner.trim(),
+        walletAddress: walletAddress || undefined,
         propertyId: propertyId.trim() || undefined,
         issueDate,
         expiryDate: expiryDate ? expiryDate : undefined,
@@ -770,7 +794,23 @@ export const RegisterDocumentPage: React.FC = () => {
 
   const handleConfirmPreSign = async () => {
     setPreSignModalOpen(false);
+    if (walletStatus === 'connected' && !isCorrectNetwork) {
+      addToast(
+        'Network Mismatch',
+        `Your connected wallet is on a different chain. Please switch to ${activeNetworkConfig.name} before submitting.`,
+        'error'
+      );
+      return;
+    }
     if (selectedNetwork === 'mainnet') {
+      if (!isContractConfigured('mainnet')) {
+        addToast(
+          'Mainnet Contract Not Configured',
+          'MAINNET CONTRACT NOT DEPLOYED/CONFIGURED. Mainnet registrations are blocked until the contract is deployed.',
+          'error'
+        );
+        return;
+      }
       if (walletStatus === 'connected') {
         const capabilities = await verifyContractCapabilities('mainnet');
         if (!capabilities.valid) {
@@ -1296,6 +1336,37 @@ export const RegisterDocumentPage: React.FC = () => {
               </div>
             </div>
           </Card>
+        ) : !isAuthor ? (
+          <Card className="p-8 text-center flex flex-col items-center justify-center space-y-4 bg-white border border-black/10">
+            <div className="w-16 h-16 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center">
+              <ShieldAlert className="w-8 h-8" />
+            </div>
+            <div className="max-w-md space-y-2">
+              <h3 className="text-lg font-bold text-[#1C1C1C]">Author Access Required</h3>
+              <p className="text-xs text-stone-500 leading-relaxed">
+                Document registration on MST Chain is restricted to authorized Secondary Authors and the Super Author. Public Users do not possess on-chain registration privileges.
+              </p>
+              <div className="text-xs text-stone-600 bg-stone-50 p-3 rounded-xl border border-black/5 font-mono break-all">
+                Connected Wallet: {walletAddress || 'Disconnected'}
+              </div>
+            </div>
+            <div className="flex items-center gap-3 pt-2">
+              <Button
+                variant="primary-app"
+                size="md"
+                onClick={() => navigate('/app/apply-author')}
+              >
+                Apply to Become an Author
+              </Button>
+              <Button
+                variant="secondary"
+                size="md"
+                onClick={() => navigate('/app/verify')}
+              >
+                Verify Existing Document
+              </Button>
+            </div>
+          </Card>
         ) : (
           /* Registration Input Form */
           <form onSubmit={handleSubmit} className="space-y-6">
@@ -1348,11 +1419,21 @@ export const RegisterDocumentPage: React.FC = () => {
                       <span>Checking global uniqueness across active & historical contracts...</span>
                     </p>
                   ) : idCheckStatus?.available === false ? (
-                    <div className="p-2.5 bg-red-50 rounded-xl border border-red-200 text-xs text-red-800 flex items-start gap-2">
-                      <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                    <div className={`p-2.5 rounded-xl border text-xs flex items-start gap-2 ${
+                      idCheckStatus.error?.toLowerCase().includes('rpc')
+                        ? 'bg-amber-50 border-amber-200 text-amber-800'
+                        : 'bg-red-50 border-red-200 text-red-800'
+                    }`}>
+                      <AlertTriangle className={`w-4 h-4 shrink-0 mt-0.5 ${
+                        idCheckStatus.error?.toLowerCase().includes('rpc')
+                          ? 'text-amber-600'
+                          : 'text-red-600'
+                      }`} />
                       <div className="space-y-0.5">
                         <span className="font-bold block">
-                          {idCheckStatus.error?.includes('historical')
+                          {idCheckStatus.error?.toLowerCase().includes('rpc')
+                            ? 'On-Chain RPC Verification Failure'
+                            : idCheckStatus.error?.includes('historical')
                             ? 'Historical Registry Collision'
                             : idCheckStatus.error?.includes('active')
                             ? 'Active Registry Collision'
@@ -1365,17 +1446,29 @@ export const RegisterDocumentPage: React.FC = () => {
                     </div>
                   ) : documentId.trim() && idCheckStatus?.available ? (
                     idCheckStatus.warning ? (
-                      <div className="p-2.5 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-800 flex items-start gap-2">
-                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                      <div className={`p-2.5 rounded-xl border text-xs flex items-start gap-2 ${
+                        idCheckStatus.warning.toLowerCase().includes('unavailable')
+                          ? 'bg-blue-50/80 border-blue-200/80 text-blue-900'
+                          : 'bg-amber-50 border-amber-200 text-amber-800'
+                      }`}>
+                        {idCheckStatus.warning.toLowerCase().includes('unavailable') ? (
+                          <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+                        ) : (
+                          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                        )}
                         <div className="space-y-0.5">
-                          <span className="font-bold block">On-Chain Verification Notice</span>
+                          <span className="font-bold block">
+                            {idCheckStatus.warning.toLowerCase().includes('unavailable')
+                              ? 'On-Chain Registry Status'
+                              : 'On-Chain Verification Notice'}
+                          </span>
                           <p>{idCheckStatus.warning}</p>
                         </div>
                       </div>
                     ) : (
                       <p className="text-[11px] text-emerald-700 font-medium flex items-center gap-1.5 pt-0.5">
                         <Check className="w-3.5 h-3.5 text-emerald-600" />
-                        <span>Document ID is unique and available across active and historical registries.</span>
+                        <span>Document ID is unique and verified across active and historical registries.</span>
                       </p>
                     )
                   ) : null}

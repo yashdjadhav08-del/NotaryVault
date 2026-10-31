@@ -7,6 +7,7 @@ import {
   getOnChainDetails, 
   getExplorerTxUrl, 
   getExplorerAddressUrl, 
+  isContractConfigured,
   type OnChainDocumentDetails 
 } from '../services/contractService';
 import { normalizeDocumentId } from '../lib/id';
@@ -62,6 +63,25 @@ export const QRVerificationPage: React.FC = () => {
     }
   }, [documentId]);
 
+  // Extract private access token from client-side URL hash fragment (#access_token=... or #token=...)
+  useEffect(() => {
+    let tokenFromUrl = '';
+    if (typeof window !== 'undefined' && window.location.hash) {
+      const hashStr = window.location.hash.replace(/^#/, '');
+      const hashParams = new URLSearchParams(hashStr);
+      tokenFromUrl = hashParams.get('access_token') || hashParams.get('token') || '';
+    }
+    if (!tokenFromUrl && typeof window !== 'undefined' && window.location.search) {
+      const searchParams = new URLSearchParams(window.location.search);
+      tokenFromUrl = searchParams.get('access_token') || searchParams.get('token') || '';
+    }
+
+    if (tokenFromUrl) {
+      setPrivateAccessToken(tokenFromUrl);
+      setShowTokenInput(true);
+    }
+  }, []);
+
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const target = searchInput.trim().toUpperCase();
@@ -82,7 +102,13 @@ export const QRVerificationPage: React.FC = () => {
     setRpcError(null);
 
     try {
-      const details = await getOnChainDetails(cleanDocId, 'testnet');
+      let details = await getOnChainDetails(cleanDocId, 'testnet');
+      if (!details.exists && isContractConfigured('mainnet')) {
+        const mainnetDetails = await getOnChainDetails(cleanDocId, 'mainnet');
+        if (mainnetDetails.exists) {
+          details = mainnetDetails;
+        }
+      }
       if (details.error && !details.exists && (details.error.toLowerCase().includes('failed') || details.error.toLowerCase().includes('network') || details.error.toLowerCase().includes('rpc'))) {
         setRpcError(details.error);
         setOnChainDetails(null);
@@ -633,8 +659,19 @@ export const QRVerificationPage: React.FC = () => {
                   {showTokenInput && (
                     <form onSubmit={handleDownloadWithAccessToken} className="pt-3 border-t border-black/5 space-y-3">
                       <div className="text-xs text-stone-600 font-medium">
-                        If the document owner shared an authorized, expiring private access token with you, enter it below to retrieve the verified file:
+                        If you received a permanent private document access link or an authorized access token, enter it below to retrieve the verified file:
                       </div>
+                      {privateAccessToken && (
+                        <div className="p-2.5 bg-blue-50/80 border border-blue-200/60 rounded-xl text-xs text-blue-900 flex items-center justify-between">
+                          <span className="font-semibold flex items-center gap-1.5">
+                            <Key className="w-3.5 h-3.5 text-[#1F6FF0]" />
+                            <span>Private Document Access Token Detected</span>
+                          </span>
+                          <span className="text-[10px] bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full font-medium">
+                            Non-Expiring Access
+                          </span>
+                        </div>
+                      )}
                       <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                         <input
                           id="private-access-token-input"

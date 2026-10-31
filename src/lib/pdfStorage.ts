@@ -12,6 +12,28 @@
  */
 
 import { areSha256HashesEqual, toPrefixedSha256 } from './hash.ts';
+import { BrowserProvider, ethers } from 'ethers';
+
+export type MSTNetworkKey = 'testnet' | 'mainnet';
+
+function checkChainIdMatchesNetwork(chainId: string | number | bigint, networkKey: MSTNetworkKey): boolean {
+  let dec: number;
+  if (typeof chainId === 'bigint') {
+    dec = Number(chainId);
+  } else if (typeof chainId === 'number') {
+    dec = chainId;
+  } else if (typeof chainId === 'string') {
+    dec = chainId.startsWith('0x') || chainId.startsWith('0X')
+      ? parseInt(chainId, 16)
+      : parseInt(chainId, 10);
+  } else {
+    return false;
+  }
+  if (isNaN(dec)) return false;
+  if (networkKey === 'testnet') return dec === 91562037;
+  if (networkKey === 'mainnet') return dec === 4646;
+  return false;
+}
 
 export interface StoredLocalPDF {
   id: string; // Canonical Document ID (e.g. NV-2026-000101)
@@ -195,6 +217,233 @@ export async function verifyAuthSignature(params: {
   } catch (err: any) {
     return { success: false, error: err?.message || 'Verification request failed.' };
   }
+}
+
+/**
+ * Signs an authentication challenge using the connected wallet.
+ * Compatible with ethers v6 BrowserProvider wrapping an EIP-1193 provider (window.ethereum, BridgeKey, EIP-6963),
+ * ethers v5/v6 Provider objects with getSigner, direct Signer objects, and raw EIP-1193 providers with personal_sign fallback.
+ *
+ * Normalizes all error modes into user-friendly messages:
+ * - "Wallet is disconnected. Please reconnect your wallet."
+ * - "Please approve the wallet signature to authorize document sharing."
+ * - "Wrong network. Please switch to the expected MST Chain network."
+ * - "Wallet signing is unavailable. Please reconnect your wallet and retry."
+ */
+export async function signAuthChallengeWithWallet(
+  rawProvider: any,
+  walletAddress: string,
+  challengeText: string,
+  options?: { expectedNetworkKey?: MSTNetworkKey }
+): Promise<string> {
+  if (!rawProvider) {
+    throw new Error('Wallet is disconnected. Please reconnect your wallet.');
+  }
+  if (!walletAddress || !ethers.isAddress(walletAddress)) {
+    throw new Error('Wallet is disconnected. Please reconnect your wallet.');
+  }
+  if (!challengeText || typeof challengeText !== 'string') {
+    throw new Error('Authentication challenge is missing or invalid.');
+  }
+
+  // 1. Verify active chain if expected network is specified
+  if (options?.expectedNetworkKey) {
+    try {
+      let chainIdHex: string | null = null;
+      if (typeof rawProvider.request === 'function') {
+        chainIdHex = await rawProvider.request({ method: 'eth_chainId' });
+      } else if (rawProvider.chainId) {
+        chainIdHex = String(rawProvider.chainId);
+      }
+      if (chainIdHex && !checkChainIdMatchesNetwork(chainIdHex, options.expectedNetworkKey)) {
+        throw new Error('Wrong network. Please switch to the expected MST Chain network.');
+      }
+    } catch (netErr: any) {
+      if (netErr?.message?.includes('Wrong network')) {
+        throw netErr;
+      }
+    }
+  }
+
+  let signature: string | null = null;
+
+  try {
+    // Strategy 1: Direct Signer object (e.g. ethers.Wallet, Hardhat signer, or custom signer with signMessage)
+    if (typeof rawProvider.signMessage === 'function') {
+      if (typeof rawProvider.getAddress === 'function') {
+        const addr = await rawProvider.getAddress();
+        if (addr && addr.toLowerCase() !== walletAddress.toLowerCase()) {
+          throw new Error('Wallet address mismatch. Please reconnect the correct wallet.');
+        }
+      }
+      signature = await rawProvider.signMessage(challengeText);
+    }
+    // Strategy 2: Ethers Provider with getSigner() (e.g. BrowserProvider or JsonRpcProvider)
+    else if (typeof rawProvider.getSigner === 'function') {
+      const signer = await rawProvider.getSigner(walletAddress);
+      if (typeof signer.getAddress === 'function') {
+        const addr = await signer.getAddress();
+        if (addr && addr.toLowerCase() !== walletAddress.toLowerCase()) {
+          throw new Error('Wallet address mismatch. Please reconnect the correct wallet.');
+        }
+      }
+      signature = await signer.signMessage(challengeText);
+    }
+    // Strategy 3: Standard EIP-1193 Provider (e.g. window.ethereum, window.bridgekey, EIP-6963)
+    else if (typeof rawProvider.request === 'function') {
+      try {
+        const browserProvider = new BrowserProvider(rawProvider, 'any');
+        const signer = await browserProvider.getSigner(walletAddress);
+        if (typeof signer.getAddress === 'function') {
+          const addr = await signer.getAddress();
+          if (addr && addr.toLowerCase() !== walletAddress.toLowerCase()) {
+            throw new Error('Wallet address mismatch. Please reconnect the correct wallet.');
+          }
+        }
+        signature = await signer.signMessage(challengeText);
+      } catch (bpErr: any) {
+        const errMsg = (bpErr?.message || '').toLowerCase();
+        const errCode = bpErr?.code;
+        // If user rejected, abort immediately without attempting fallback
+        if (
+          errCode === 4001 ||
+          errCode === 'ACTION_REJECTED' ||
+          errMsg.includes('user rejected') ||
+          errMsg.includes('user denied') ||
+          errMsg.includes('denied') ||
+          errMsg.includes('mismatch')
+        ) {
+          throw bpErr;
+        }
+
+        // Strategy 4: Fallback to EIP-1193 direct personal_sign
+        const hexMessage = ethers.hexlify(ethers.toUtf8Bytes(challengeText));
+        try {
+          signature = await rawProvider.request({
+            method: 'personal_sign',
+            params: [hexMessage, walletAddress],
+          });
+        } catch (psErr: any) {
+          const psMsg = (psErr?.message || '').toLowerCase();
+          if (psErr?.code === 4001 || psMsg.includes('user rejected') || psMsg.includes('denied')) {
+            throw psErr;
+          }
+          // Alternative parameter ordering: [address, hexMessage]
+          signature = await rawProvider.request({
+            method: 'personal_sign',
+            params: [walletAddress, hexMessage],
+          });
+        }
+      }
+    } else {
+      throw new Error('Wallet signing is unavailable. Please reconnect your wallet and retry.');
+    }
+  } catch (err: any) {
+    // Safe developer diagnostic logging without leaking secrets or payload text
+    console.warn('[NotaryVault:WalletSigning]', {
+      code: err?.code,
+      name: err?.name,
+      reason: err?.message ? String(err.message).slice(0, 100) : 'Unknown error',
+    });
+
+    const errCode = err?.code;
+    const errMsg = (err?.message || '').toLowerCase();
+
+    if (
+      errCode === 4001 ||
+      errCode === 'ACTION_REJECTED' ||
+      errMsg.includes('user rejected') ||
+      errMsg.includes('user denied') ||
+      errMsg.includes('rejected') ||
+      errMsg.includes('denied') ||
+      errMsg.includes('cancelled')
+    ) {
+      throw new Error('Please approve the wallet signature to authorize document sharing.');
+    }
+
+    if (
+      errMsg.includes('disconnected') ||
+      errMsg.includes('not connected') ||
+      errMsg.includes('no account')
+    ) {
+      throw new Error('Wallet is disconnected. Please reconnect your wallet.');
+    }
+
+    if (errMsg.includes('wrong network') || errMsg.includes('incorrect network')) {
+      throw new Error('Wrong network. Please switch to the expected MST Chain network.');
+    }
+
+    if (
+      errMsg.includes('is not a function') ||
+      errMsg.includes('unsupported') ||
+      errMsg.includes('unavailable') ||
+      errMsg.includes('does not support')
+    ) {
+      throw new Error('Wallet signing is unavailable. Please reconnect your wallet and retry.');
+    }
+
+    if (
+      err?.message?.startsWith('Please approve') ||
+      err?.message?.startsWith('Wallet is disconnected') ||
+      err?.message?.startsWith('Wrong network') ||
+      err?.message?.startsWith('Wallet signing is unavailable')
+    ) {
+      throw err;
+    }
+
+    throw new Error(err?.message || 'Wallet signing is unavailable. Please reconnect your wallet and retry.');
+  }
+
+  if (!signature || typeof signature !== 'string') {
+    throw new Error('Wallet signing is unavailable. Please reconnect your wallet and retry.');
+  }
+
+  return signature;
+}
+
+/**
+ * Authenticates the owner using cryptographic signature and establishes an authenticated session.
+ * Reuses existing active session if available and matching.
+ */
+export async function authenticateOwnerWithWallet(
+  rawProvider: any,
+  walletAddress: string,
+  options?: { expectedNetworkKey?: MSTNetworkKey }
+): Promise<AuthSession> {
+  const activeAddr = walletAddress?.toLowerCase();
+  const existingSession = getClientSession();
+  if (existingSession && activeAddr && existingSession.walletAddress.toLowerCase() === activeAddr) {
+    return existingSession;
+  }
+
+  if (!rawProvider || !walletAddress) {
+    throw new Error('Wallet is disconnected. Please reconnect your wallet.');
+  }
+
+  const challenge = await requestAuthChallenge(walletAddress);
+  if (!challenge.success || !challenge.challengeText) {
+    throw new Error(challenge.error || 'Authentication server unreachable. Please retry.');
+  }
+
+  const signature = await signAuthChallengeWithWallet(
+    rawProvider,
+    walletAddress,
+    challenge.challengeText,
+    options
+  );
+
+  const verifyRes = await verifyAuthSignature({
+    address: walletAddress,
+    signature,
+    challengeId: challenge.challengeId,
+    challengeText: challenge.challengeText,
+  });
+
+  if (!verifyRes.success || !verifyRes.session) {
+    throw new Error(verifyRes.error || 'Server authorization rejected cryptographic signature.');
+  }
+
+  return verifyRes.session;
 }
 
 // ----------------------------------------------------
@@ -492,6 +741,7 @@ export async function uploadPdfToServer(
     fileSizeBytes: number;
     pageCount?: number;
     ownerWallet?: string;
+    ownerName?: string;
     ownerEmail?: string;
     ownerMobile?: string;
     notificationConsent?: boolean;
@@ -514,6 +764,7 @@ export async function uploadPdfToServer(
       ...(normalizedHash ? { 'X-SHA256-Hash': normalizedHash } : {}),
       ...(meta.pageCount ? { 'X-Page-Count': String(meta.pageCount) } : {}),
       ...(meta.ownerWallet ? { 'X-Owner-Wallet': meta.ownerWallet.trim().toLowerCase() } : {}),
+      ...(meta.ownerName ? { 'X-Owner-Name': encodeURIComponent(meta.ownerName.trim()) } : {}),
       ...(meta.ownerEmail ? { 'X-Owner-Email': encodeURIComponent(meta.ownerEmail.trim()) } : {}),
       ...(meta.ownerMobile ? { 'X-Owner-Mobile': encodeURIComponent(meta.ownerMobile.trim()) } : {}),
       ...(meta.notificationConsent ? { 'X-Notification-Consent': 'true' } : {}),
@@ -616,6 +867,8 @@ export async function confirmServerRegistration(
     category?: string;
     issuer?: string;
     status?: string;
+    registrantAddress?: string;
+    ownerWallet?: string;
   }
 ): Promise<{ success: boolean; error?: string }> {
   try {
@@ -669,8 +922,10 @@ export async function fetchPdfFromServer(
     const headers: Record<string, string> = {};
     if (auth?.sessionToken) {
       headers['Authorization'] = `Bearer ${auth.sessionToken}`;
-    } else if (auth?.accessToken) {
-      endpoint += `?token=${encodeURIComponent(auth.accessToken)}`;
+    }
+    if (auth?.accessToken) {
+      // Pass bearer token strictly via HTTP header to prevent leaking into URL query parameters or proxy logs
+      headers['X-Access-Token'] = auth.accessToken;
     }
 
     const res = await fetch(endpoint, { headers });
