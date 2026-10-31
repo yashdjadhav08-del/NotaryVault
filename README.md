@@ -6,15 +6,17 @@
 
 **Decentralized, tamper-evident document notarization, cryptographic provenance tracking, and access-controlled sharing anchored on MST Chain.**
 
+[![Live App](https://img.shields.io/badge/Live%20Demo-Vercel%20Production-000000?style=flat-square&logo=vercel)](https://notary-vault-woad.vercel.app)
+[![Demo Video](https://img.shields.io/badge/Demo%20Video-Google%20Drive-4285F4?style=flat-square&logo=googledrive&logoColor=white)](https://drive.google.com/file/d/1m5ID2r3Kta8ItnuWBTuoh6bieDrV_OAw/view?usp=sharing)
 [![MST Chain](https://img.shields.io/badge/Network-MST%20Chain%20(Testnet%20%26%20Mainnet)-8B5CF6?style=flat-square)](https://mstscan.com)
 [![Solidity](https://img.shields.io/badge/Solidity-0.8.28-363636?style=flat-square&logo=solidity)](contracts/NotaryVaultRegistry.sol)
 [![React 19](https://img.shields.io/badge/Frontend-React%2019%20%2B%20Vite%208-61DAFB?style=flat-square&logo=react)](package.json)
 [![TypeScript](https://img.shields.io/badge/Language-TypeScript%207-3178C6?style=flat-square&logo=typescript)](tsconfig.json)
 [![Ethers.js](https://img.shields.io/badge/Web3-Ethers%20v6.17-2535A0?style=flat-square)](package.json)
-[![Tests](https://img.shields.io/badge/Test%20Suite-24%2F24%20Passed%20(100%25)-10B981?style=flat-square)](scripts/test-runner.js)
+[![Tests](https://img.shields.io/badge/Test%20Suite-25%2F25%20Passed%20(100%25)-10B981?style=flat-square)](scripts/test-runner.js)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
-[Live Demo](#-live-deployment--demo) • [System Architecture](#-system-architecture) • [Core Workflow](#-end-to-end-application-workflow) • [Smart Contracts](#-smart-contract-architecture) • [Deployment Records](#-mst-chain-deployment-information) • [Local Setup](#-installation--local-development) • [Vercel Readiness](#-vercel-deployment-readiness)
+[Live App (Vercel)](https://notary-vault-woad.vercel.app) • [Demo Video](https://drive.google.com/file/d/1m5ID2r3Kta8ItnuWBTuoh6bieDrV_OAw/view?usp=sharing) • [System Architecture](#-system-architecture) • [Core Workflow](#-end-to-end-application-workflow) • [Smart Contracts](#-smart-contract-architecture) • [Deployment Records](#-mst-chain-deployment-information) • [Local Setup](#-installation--local-development) • [Production Deployment](#-production-deployment-architecture)
 
 </div>
 
@@ -43,14 +45,12 @@ Document fraud, unauthorized deed alterations, forged power of attorney instrume
 ## 🚀 Live Deployment & Demo
 
 ### 🌐 Live Deployment
-<!-- TODO: Add the final deployed Vercel URL -->
-[![Live App](https://img.shields.io/badge/Vercel-Open%20Live%20Demo-black?style=for-the-badge&logo=vercel)](#)  
-> **Live Demo URL**: `https://[your-vercel-deployment].vercel.app` *(Placeholder — Add final production URL here)*
+[![Live App](https://img.shields.io/badge/Vercel-Open%20Live%20Demo-black?style=for-the-badge&logo=vercel)](https://notary-vault-woad.vercel.app)  
+> **Live Production URL**: [https://notary-vault-woad.vercel.app](https://notary-vault-woad.vercel.app)
 
 ### 🎥 Demonstration Video
-<!-- TODO: Add NotaryVault walkthrough video URL -->
-[![Watch Demo](https://img.shields.io/badge/YouTube-Watch%20Walkthrough-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](#)  
-> **Walkthrough Video**: `https://[your-video-link]` *(Placeholder — Add final video walkthrough URL here)*
+[![Watch Demo](https://img.shields.io/badge/Google%20Drive-Watch%20Walkthrough%20Demo-4285F4?style=for-the-badge&logo=googledrive&logoColor=white)](https://drive.google.com/file/d/1m5ID2r3Kta8ItnuWBTuoh6bieDrV_OAw/view?usp=sharing)  
+> **Walkthrough Video**: [Watch NotaryVault Demo Video on Google Drive](https://drive.google.com/file/d/1m5ID2r3Kta8ItnuWBTuoh6bieDrV_OAw/view?usp=sharing)
 
 ---
 
@@ -439,10 +439,10 @@ npm run dev
 
 ## 🧪 Testing & Quality Assurance
 
-NotaryVault includes an automated 24-suite test harness verifying smart contracts, RPC reliability, EIP-191 signatures, RBAC boundaries, and delivery diagnostics:
+NotaryVault includes an automated 25-suite test harness verifying smart contracts, RPC reliability, EIP-191 signatures, RBAC boundaries, delivery diagnostics, CORS origin security, and production deployment configuration:
 
 ```bash
-# Execute the full 24-suite automated verification harness
+# Execute the full 25-suite automated verification harness
 npm run test:contracts
 ```
 
@@ -474,8 +474,9 @@ npm run test:contracts
 ✔ SUITE 22 COMPLETE: Mainnet Contract Verification & Role Access Fix Tests
 ✔ SUITE 23 COMPLETE: Ethers v6 Wallet Signing, EIP-1193 & Sharing Workflow Tests
 ✔ SUITE 24 COMPLETE: Document Sharing Authorization, Email Diagnostics & Status Accuracy Tests
+✔ SUITE 25 COMPLETE: Production Deployment Readiness, CORS & Security Tests
 ====================================================
-🎉 ALL 24 CONTRACT, MULTI-NETWORK, PERSISTENCE, APPLICATION, RBAC, STRICT SEPARATION, MAINNET DEPLOYMENT, RPC RELIABILITY, WALLET SIGNING & DOCUMENT SHARING TESTS PASSED WITH 100% SUCCESS!
+🎉 ALL 25 CONTRACT, MULTI-NETWORK, PERSISTENCE, APPLICATION, RBAC, STRICT SEPARATION, MAINNET DEPLOYMENT, RPC RELIABILITY, WALLET SIGNING, SHARING & PRODUCTION DEPLOYMENT TESTS PASSED WITH 100% SUCCESS!
 ====================================================
 ```
 
@@ -487,26 +488,105 @@ npm run build
 
 ---
 
-## ☁️ Vercel Deployment Readiness
+## ☁️ Complete Production Architecture & Deployment Guide
 
-### Frontend SPA Deployment
-The frontend is a single-page application built with React 19 and Vite 8 that can be deployed directly to Vercel:
-- **Framework Preset**: `Vite`
-- **Build Command**: `npm run build`
-- **Output Directory**: `dist`
-- **SPA Rewrites**: Handled in root [`vercel.json`](file:///d:/dapp/vercel.json) to route all paths to `index.html`.
+NotaryVault divides responsibilities between a globally distributed frontend Single Page Application (SPA) and a persistent, stateful Node.js backend API:
 
-### Backend Storage & Persistence Architecture for Production
-> ⚠️ **Important Production Storage Notice**:  
-> In local development, the backend uses a persistent Node.js process writing to a local SQLite database (`storage/notaryvault.db`) and a local uploads folder (`storage/uploads/`).  
-> **Vercel Serverless Functions have ephemeral, read-only filesystems**; files written to local disk will not persist across invocations.
+```
+┌─────────────────────────────────┐        HTTPS / JSON RPC        ┌──────────────────────────────────┐
+│      Frontend Client (SPA)      │ ─────────────────────────────▶ │   MST Chain Smart Contracts      │
+│     Hosted on Vercel Edge       │                                │   • Mainnet (Chain ID: 4646)     │
+│   https://notaryvault.vercel.app│ ◀───────────────────────────── │   • Testnet (Chain ID: 91562037) │
+└────────────────┬────────────────┘                                └──────────────────────────────────┘
+                 │
+                 │ Authenticated API Calls & File Transfers
+                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Persistent Backend API Server                      │
+│        Hosted on Render / Railway / Fly.io / Docker             │
+│        https://api.notaryvault.yourdomain.com                   │
+│                                                                 │
+│  ┌─────────────────────────────┐ ┌───────────────────────────┐  │
+│  │   SQLite Metadata DB        │ │   Private PDF Storage     │  │
+│  │   /app/storage/notaryvault  │ │   /app/storage/uploads/   │  │
+│  └─────────────────────────────┘ └───────────────────────────┘  │
+│         ▲                                    ▲                  │
+│         └────────────── Persistent Volume ───┴──────────────────┘
+```
 
-#### Production Deployment Requirements:
-1. **Frontend Hosting**: Deploy the frontend on **Vercel** (`dist/`), setting `VITE_STORAGE_SERVER_URL` to point to your production backend.
-2. **Backend Hosting**: Deploy the Node.js API server (`server/index.js`) to a platform that supports persistent workloads:
-   - **Container / VM Option (Recommended)**: Deploy to **Render**, **Railway**, **Fly.io**, or **AWS EC2** with a persistent disk volume mounted for `/storage`.
-   - **Serverless Cloud Migration Option**: Transition local SQLite to a cloud database (e.g., Turso libSQL or Supabase PostgreSQL) and store original PDF binaries in S3-compatible cloud object storage (AWS S3 or Cloudflare R2).
-3. **Environment Configuration**: Set production environment variables (`EMAIL_PROVIDER`, `RESEND_API_KEY`, `EMAIL_FROM`, `AUTH_SESSION_SECRET`, `MST_MAINNET_RPC_URL`) securely in the hosting dashboard.
+### 1. Frontend Deployment on Vercel
+- **Live Deployed Production URL**: [https://notary-vault-woad.vercel.app](https://notary-vault-woad.vercel.app)
+1. Import repository at [vercel.com/new](https://vercel.com/new).
+2. Framework preset: **Vite** (Root Directory: `./`).
+3. Build Command: `npm run build` | Output Directory: `dist`.
+4. Set Environment Variable in Vercel:
+   ```ini
+   VITE_STORAGE_SERVER_URL=https://api.notaryvault.yourdomain.com
+   ```
+5. Deploy. Vercel automatically routes all client-side navigation using the included [`vercel.json`](file:///d:/dapp/vercel.json).
+
+### 2. Backend Deployment (Render / Railway / Docker Container)
+The backend requires a persistent environment with a mounted storage volume to preserve the SQLite database and original PDFs across deployments.
+
+#### Option A: Docker Container (Render / Railway / Fly.io / Self-Hosted)
+Build and run with the included [`Dockerfile`](file:///d:/dapp/Dockerfile):
+```bash
+# Build the production container image
+docker build -t notaryvault-api .
+
+# Run with persistent volume mounted at /app/storage
+docker run -d \
+  --name notaryvault-backend \
+  -p 5001:5001 \
+  -v notaryvault_data:/app/storage \
+  -e NODE_ENV=production \
+  -e PORT=5001 \
+  -e ALLOWED_ORIGINS="https://notary-vault-woad.vercel.app,https://*.vercel.app" \
+  -e PUBLIC_APP_URL="https://notary-vault-woad.vercel.app" \
+  -e EMAIL_PROVIDER="resend" \
+  -e RESEND_API_KEY="re_your_api_key" \
+  -e EMAIL_FROM="NotaryVault <onboarding@resend.dev>" \
+  notaryvault-api
+```
+
+#### Option B: Render Web Service
+1. Connect repository on [render.com](https://render.com).
+2. Select **Web Service** with Docker environment or Node runtime.
+3. Build Command: `npm install --omit=dev` | Start Command: `node server/index.js`.
+4. Attach a **Persistent Disk** mounted at `/app/storage` (10 GB recommended).
+5. Add production environment variables in the Render dashboard.
+
+### 3. Environment Variables Reference
+
+| Variable | Environment | Scope | Description | Example Value |
+|:---|:---|:---|:---|:---|
+| `VITE_STORAGE_SERVER_URL` | Frontend | **Public** | URL of your deployed backend server | `https://api.notaryvault.com` |
+| `PORT` | Backend | **Public** | Port the HTTP server binds to | `5001` |
+| `ALLOWED_ORIGINS` | Backend | **Public** | Comma-separated CORS allowed origins | `https://notaryvault.vercel.app` |
+| `PUBLIC_APP_URL` | Backend | **Public** | Canonical URL for email verification links | `https://notaryvault.vercel.app` |
+| `STORAGE_DIR` | Backend | **Public** | Base directory for persistent files | `/app/storage` |
+| `UPLOADS_DIR` | Backend | **Public** | Directory for private PDF uploads | `/app/storage/uploads` |
+| `DATABASE_PATH` | Backend | **Public** | File path for SQLite database | `/app/storage/notaryvault.db` |
+| `AUTH_SESSION_SECRET` | Backend | **SECRET** | Cryptographic session signing secret | `random_64_char_hex_string` |
+| `EMAIL_PROVIDER` | Backend | **Public** | Email provider (`resend` or `smtp`) | `resend` |
+| `RESEND_API_KEY` | Backend | **SECRET** | Resend transactional email API key | `re_xxxxxxxxxxxx` |
+| `EMAIL_FROM` | Backend | **Public** | Verified sender identity | `NotaryVault <onboarding@resend.dev>` |
+| `MST_TESTNET_RPC_URL` | Backend/CLI| **Public** | MST Chain Testnet RPC endpoint | `https://testnetrpc.mstblockchain.com` |
+| `MST_MAINNET_RPC_URL` | Backend/CLI| **Public** | MST Chain Mainnet RPC endpoint | `https://mariorpc.mstblockchain.com` |
+
+> 🔒 **Security Notice**: Never configure private keys (`DEPLOYER_PRIVATE_KEY`) in frontend environment variables or public repository settings.
+
+### 4. Database & File Storage Backup Procedures
+- **SQLite Database Backup**:
+  ```bash
+  # Live safe SQLite backup without locking active queries
+  sqlite3 /app/storage/notaryvault.db ".backup /app/storage/backups/notaryvault_$(date +%F).db"
+  ```
+- **PDF Uploads Backup**:
+  ```bash
+  # Archive uploaded original PDF documents
+  tar -czf /app/storage/backups/uploads_$(date +%F).tar.gz -C /app/storage uploads/
+  ```
 
 ---
 

@@ -2295,9 +2295,22 @@ export async function saveMainnetDeploymentRecord(record: any): Promise<void> {
 
   // 3. Notify backend server to persist into src/contracts/deployment.json
   try {
-    const backendUrl = typeof window !== 'undefined' && (window as any).__NOTARYVAULT_STORAGE_URL__
-      ? (window as any).__NOTARYVAULT_STORAGE_URL__
-      : 'http://localhost:5001';
+    let backendUrl = 'http://localhost:5001';
+    if (typeof process !== 'undefined' && process.env?.VITE_STORAGE_SERVER_URL) {
+      backendUrl = process.env.VITE_STORAGE_SERVER_URL;
+    } else if (typeof process !== 'undefined' && process.env?.VITE_STORAGE_BACKEND_URL) {
+      backendUrl = process.env.VITE_STORAGE_BACKEND_URL;
+    } else if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_STORAGE_SERVER_URL) {
+      backendUrl = (import.meta as any).env.VITE_STORAGE_SERVER_URL;
+    } else if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_STORAGE_BACKEND_URL) {
+      backendUrl = (import.meta as any).env.VITE_STORAGE_BACKEND_URL;
+    } else if (typeof window !== 'undefined' && (window as any).__NOTARYVAULT_STORAGE_URL__) {
+      backendUrl = (window as any).__NOTARYVAULT_STORAGE_URL__;
+    } else if (typeof window !== 'undefined') {
+      const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      backendUrl = isLocalhost ? 'http://localhost:5001' : '';
+    }
+    backendUrl = backendUrl.replace(/\/$/, '');
 
     await fetch(`${backendUrl}/api/deployment/record`, {
       method: 'POST',

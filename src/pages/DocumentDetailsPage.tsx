@@ -1409,9 +1409,21 @@ export const DocumentDetailsPage: React.FC = () => {
                     <p className="text-rose-800 text-[11px] leading-relaxed break-words font-medium">
                       {shareDeliveryResult.emailDelivery?.error || 'The email provider rejected the delivery request.'}
                     </p>
-                    <p className="text-[10px] text-stone-500 pt-1 border-t border-rose-100">
-                      Note: A secure access token was created, but the email could not be delivered to <span className="font-semibold text-stone-700">{shareEmail}</span>. You can copy the link below to share it manually.
-                    </p>
+                    <div className="pt-2 flex items-center justify-between border-t border-rose-100">
+                      <p className="text-[10px] text-stone-500">
+                        Note: Token created, but delivery failed. You can update the address above and retry without another blockchain transaction.
+                      </p>
+                      <Button
+                        type="button"
+                        variant="primary-app"
+                        size="sm"
+                        loading={isSharing}
+                        onClick={handleShareSubmit}
+                        icon={<Send className="w-3.5 h-3.5" />}
+                      >
+                        Retry Delivery
+                      </Button>
+                    </div>
                   </div>
                 )}
 

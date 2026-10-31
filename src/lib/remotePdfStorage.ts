@@ -24,9 +24,13 @@ export interface StorageArchitectureStatus {
  * Correctly identifies local server-side SQLite storage and cross-device limitations.
  */
 export function getStorageArchitectureStatus(): StorageArchitectureStatus {
-  const customBackendUrl = typeof process !== 'undefined' && process.env?.VITE_STORAGE_BACKEND_URL
-    ? process.env.VITE_STORAGE_BACKEND_URL
-    : (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_STORAGE_BACKEND_URL ? (import.meta as any).env.VITE_STORAGE_BACKEND_URL : '');
+  let customBackendUrl = '';
+  if (typeof process !== 'undefined' && process.env) {
+    customBackendUrl = process.env.VITE_STORAGE_SERVER_URL || process.env.VITE_STORAGE_BACKEND_URL || process.env.VITE_API_URL || '';
+  } else if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+    const meta = (import.meta as any).env;
+    customBackendUrl = meta.VITE_STORAGE_SERVER_URL || meta.VITE_STORAGE_BACKEND_URL || meta.VITE_API_URL || '';
+  }
 
   if (customBackendUrl && !customBackendUrl.includes('localhost') && !customBackendUrl.includes('127.0.0.1')) {
     return {

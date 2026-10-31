@@ -11,6 +11,7 @@ import {
   sendEmailNotification,
   sendSmsNotification
 } from './notifications.js';
+import { StorageProvider } from './storageProvider.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -435,14 +436,35 @@ export function initStorageDatabase(dbFilePath) {
 /**
  * Sets standard Cross-Origin Resource Sharing (CORS) headers.
  */
-function setCorsHeaders(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+function setCorsHeaders(res, req) {
+  const origin = req?.headers?.origin;
+  const allowedOriginsEnv = process.env.ALLOWED_ORIGINS;
+
+  if (allowedOriginsEnv && origin) {
+    const allowed = allowedOriginsEnv.split(',').map((s) => s.trim().toLowerCase());
+    const lowerOrigin = origin.toLowerCase();
+    const isAllowed = allowed.includes('*') || 
+      allowed.includes(lowerOrigin) || 
+      (lowerOrigin.endsWith('.vercel.app') && allowed.some((a) => a.includes('vercel.app')));
+
+    if (isAllowed) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', allowed[0] || '*');
+    }
+  } else {
+    // Development or unconfigured fallback
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  }
+
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Content-Length, X-File-Name, X-SHA256-Hash, X-Page-Count, X-Owner-Wallet, X-Owner-Email, X-Owner-Mobile, X-Notification-Consent, X-Access-Token, X-Tx-Hash, X-Block-Number, Authorization'
+    'Content-Type, Content-Length, X-File-Name, X-SHA256-Hash, X-Page-Count, X-Owner-Wallet, X-Owner-Name, X-Owner-Email, X-Owner-Mobile, X-Notification-Consent, X-Access-Token, X-Tx-Hash, X-Block-Number, X-Wallet-Address, X-Authenticated-Wallet, X-Author-Address, X-Caller-Address, X-Document-ID, Authorization'
   );
   res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-SHA256-Hash, X-Document-ID');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
 }
 
 /**
@@ -466,17 +488,18 @@ function readJsonBody(req) {
 }
 
 /**
- * Creates and configures the local development PDF storage HTTP server.
+ * Creates and configures the local/production PDF storage HTTP server.
  */
 export function createServer(options = {}) {
-  const baseStorageDir = options.storageDir || path.resolve(__dirname, '../storage');
-  const uploadsDir = path.resolve(baseStorageDir, 'uploads');
-  const dbFilePath = options.dbPath || path.resolve(baseStorageDir, 'notaryvault.db');
+  const baseStorageDir = options.storageDir || process.env.STORAGE_DIR || path.resolve(__dirname, '../storage');
+  const uploadsDir = options.uploadsDir || process.env.UPLOADS_DIR || path.resolve(baseStorageDir, 'uploads');
+  const dbFilePath = options.dbPath || process.env.DATABASE_PATH || path.resolve(baseStorageDir, 'notaryvault.db');
 
   if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
   }
 
+  const storageProvider = new StorageProvider({ uploadsDir });
   const db = initStorageDatabase(dbFilePath);
 
   // Prepared SQLite queries
@@ -593,7 +616,7 @@ export function createServer(options = {}) {
   }
 
   const server = http.createServer(async (req, res) => {
-    setCorsHeaders(res);
+    setCorsHeaders(res, req);
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -611,9 +634,13 @@ export function createServer(options = {}) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
-        provider: 'local_sqlite_server',
+        provider: storageProvider.getStorageType() === 's3_compatible' ? 's3_compatible' : 'local_sqlite_server',
+        storageType: storageProvider.getStorageType(),
         maxSizeBytes: MAX_PDF_SIZE_BYTES,
-        notice: 'Local development storage active. Files are stored on local filesystem outside public web root.',
+        persistentStorage: storageProvider.isCloudStorage() || Boolean(process.env.STORAGE_DIR),
+        notice: storageProvider.isCloudStorage()
+          ? 'Cloud object storage active (S3-compatible bucket). Files survive restarts and are accessible across devices.'
+          : 'Local development storage active. Files are stored on local filesystem outside public web root.',
       }));
       return;
     }
@@ -875,23 +902,16 @@ export function createServer(options = {}) {
           }
         }
 
-        const safeStorageFileName = `${documentId}.pdf`;
-        const targetPath = path.resolve(uploadsDir, safeStorageFileName);
-
-        if (!targetPath.startsWith(uploadsDir)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: 'Path traversal prevented.' }));
-          return;
-        }
-
+        let saveResult;
         try {
-          fs.writeFileSync(targetPath, bodyBuffer);
+          saveResult = await storageProvider.savePdf(documentId, bodyBuffer, { fileName: clientFileName });
         } catch (err) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: `Failed to write file to disk: ${err.message}` }));
+          res.end(JSON.stringify({ success: false, error: `Failed to persist file in storage: ${err.message}` }));
           return;
         }
 
+        const safeStorageFileName = saveResult.storedPath;
         const pageCountHeader = req.headers['x-page-count'];
         const pageCount = pageCountHeader ? parseInt(pageCountHeader, 10) : null;
         const nowIso = new Date().toISOString();
@@ -927,41 +947,25 @@ export function createServer(options = {}) {
             ownerName || null
           );
         } catch (dbErr) {
-          try { fs.unlinkSync(targetPath); } catch {}
+          try { await storageProvider.deletePdf(documentId, safeStorageFileName); } catch {}
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, error: `Failed to insert record into SQLite: ${dbErr.message}` }));
           return;
         }
 
         // Post-write durability and hash verification before sending success
-        if (!fs.existsSync(targetPath)) {
+        const postWriteVerify = await storageProvider.verifyStorage(documentId, safeStorageFileName, computedRaw);
+        if (!postWriteVerify.exists || !postWriteVerify.matches) {
+          try { await storageProvider.deletePdf(documentId, safeStorageFileName); } catch {}
           try { deleteDocStmt.run(documentId); } catch {}
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: 'Storage verification failed: Written PDF file not found on disk.' }));
-          return;
-        }
-
-        try {
-          const writtenBytes = fs.readFileSync(targetPath);
-          const verifyRaw = crypto.createHash('sha256').update(writtenBytes).digest('hex').toLowerCase();
-          if (verifyRaw !== computedRaw) {
-            try { fs.unlinkSync(targetPath); } catch {}
-            try { deleteDocStmt.run(documentId); } catch {}
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: 'Storage verification failed: Disk file SHA-256 does not match original bytes.' }));
-            return;
-          }
-        } catch (readErr) {
-          try { fs.unlinkSync(targetPath); } catch {}
-          try { deleteDocStmt.run(documentId); } catch {}
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: `Storage verification failed: Could not read back stored file: ${readErr.message}` }));
+          res.end(JSON.stringify({ success: false, error: `Storage verification failed: ${postWriteVerify.error || 'Stored file not verified.'}` }));
           return;
         }
 
         const writtenRecord = getDocStmt.get(documentId);
         if (!writtenRecord) {
-          try { fs.unlinkSync(targetPath); } catch {}
+          try { await storageProvider.deletePdf(documentId, safeStorageFileName); } catch {}
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, error: 'Storage verification failed: SQLite record commit could not be verified.' }));
           return;
@@ -1006,23 +1010,20 @@ export function createServer(options = {}) {
         return;
       }
 
-      const filePath = path.resolve(uploadsDir, record.stored_path);
-      if (!filePath.startsWith(uploadsDir) || !fs.existsSync(filePath)) {
+      const verifyResult = await storageProvider.verifyStorage(documentId, record.stored_path, record.sha256_hash);
+      if (!verifyResult.exists) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ verified: false, error: `Original PDF file is missing from disk storage.` }));
+        res.end(JSON.stringify({ verified: false, error: `Original PDF file is missing from persistent storage.` }));
         return;
       }
 
-      const fileBytes = fs.readFileSync(filePath);
-      const computedRaw = crypto.createHash('sha256').update(fileBytes).digest('hex').toLowerCase();
-      const recordRaw = record.sha256_hash.trim().toLowerCase().replace(/^0x/, '');
-      if (computedRaw !== recordRaw) {
+      if (!verifyResult.matches) {
         res.writeHead(409, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           verified: false,
           error: `Storage integrity verification failed: Stored file SHA-256 does not match recorded baseline.`,
           expectedHash: record.sha256_hash,
-          computedHash: '0x' + computedRaw,
+          computedHash: verifyResult.sha256Hash,
         }));
         return;
       }
@@ -1036,7 +1037,7 @@ export function createServer(options = {}) {
         sha256Hash: record.sha256_hash,
         storedAt: record.stored_at,
         registrationStatus: record.registration_status || (record.tx_hash ? 'confirmed' : 'pending'),
-        storageProvider: 'local_sqlite_server',
+        storageProvider: storageProvider.getStorageType() === 's3_compatible' ? 's3_compatible' : 'local_sqlite_server',
         diskHashVerified: true,
       }));
       return;
@@ -1351,14 +1352,13 @@ export function createServer(options = {}) {
       }
 
       // 2. Strict PDF Retrieval & SHA-256 Recomputation vs Registered Hash
-      const filePath = path.resolve(uploadsDir, record.stored_path);
-      if (!filePath.startsWith(uploadsDir) || !fs.existsSync(filePath)) {
+      const pdfBytes = await storageProvider.getPdf(documentId, record.stored_path);
+      if (!pdfBytes) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: 'Original PDF file is missing from local server storage directory.' }));
+        res.end(JSON.stringify({ success: false, error: 'Original PDF file is missing from local server storage.' }));
         return;
       }
 
-      const pdfBytes = fs.readFileSync(filePath);
       const computedRaw = crypto.createHash('sha256').update(pdfBytes).digest('hex').toLowerCase();
       const recordedRaw = normalizeSha256Hex(record.sha256_hash);
 
@@ -1410,7 +1410,7 @@ export function createServer(options = {}) {
         effectivePolicy
       );
 
-      const appBaseUrl = req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`;
+      const appBaseUrl = (process.env.PUBLIC_APP_URL || req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`).replace(/\/$/, '');
       const secureAccessUrl = `${appBaseUrl}/verify/${encodeURIComponent(documentId)}?token=${encodeURIComponent(tokenId)}`;
 
       // 4. Dispatch Email with PDF attachment if requested
@@ -1672,31 +1672,29 @@ export function createServer(options = {}) {
         return;
       }
 
-      // File retrieval & verification
-      const filePath = path.resolve(uploadsDir, record.stored_path);
-      if (!filePath.startsWith(uploadsDir) || !fs.existsSync(filePath)) {
+      // File retrieval & verification via storageProvider
+      const fileBytes = await storageProvider.getPdf(documentId, record.stored_path);
+      if (!fileBytes) {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           success: false,
-          error: 'Document record found, but the file is missing from local storage directory.',
+          error: 'Document record found, but the file is missing from storage.',
         }));
         return;
       }
 
-      const stat = fs.statSync(filePath);
       const safeDownloadName = encodeURIComponent(record.file_name);
 
       res.writeHead(200, {
         'Content-Type': 'application/pdf',
-        'Content-Length': stat.size,
+        'Content-Length': fileBytes.length,
         'Content-Disposition': `attachment; filename="${safeDownloadName}"; filename*=UTF-8''${safeDownloadName}`,
         'X-SHA256-Hash': record.sha256_hash,
         'X-Document-ID': record.document_id,
         'X-Auth-Method': authMethod,
       });
 
-      const readStream = fs.createReadStream(filePath);
-      readStream.pipe(res);
+      res.end(fileBytes);
       return;
     }
 
@@ -1766,26 +1764,24 @@ export function createServer(options = {}) {
 
         // Retrieve uploaded PDF from storage and verify SHA-256 integrity
         let attachment = null;
-        const filePath = path.resolve(uploadsDir, record.stored_path);
-        if (!filePath.startsWith(uploadsDir) || !fs.existsSync(filePath)) {
-          console.warn(`[Notification] Document file not found on disk: ${filePath}`);
+        const fileBytes = await storageProvider.getPdf(documentId, record.stored_path);
+        if (!fileBytes) {
+          console.warn(`[Notification] Document file not found in storage for ${documentId}`);
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             success: false,
             category: 'file_missing',
-            error: 'Original PDF is missing: Stored file was not found in private server storage.',
+            error: 'Original PDF is missing: Stored file was not found in storage.',
             notifications: {
               email: {
                 status: 'failed',
                 category: 'file_missing',
-                error: 'Original PDF is missing: Stored file was not found in private server storage.',
+                error: 'Original PDF is missing: Stored file was not found in storage.',
               },
             },
           }));
           return;
         }
-
-        const fileBytes = fs.readFileSync(filePath);
         const computedRaw = crypto.createHash('sha256').update(fileBytes).digest('hex').toLowerCase();
         const computedHash = '0x' + computedRaw;
         const targetRaw = normalizeSha256Hex(sha256Hash || record.sha256_hash);
@@ -1840,11 +1836,12 @@ export function createServer(options = {}) {
           );
 
           permanentAccessToken = secretToken;
-          const appBaseUrl = req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`;
+          const appBaseUrl = (process.env.PUBLIC_APP_URL || req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`).replace(/\/$/, '');
           // Requirement 6: Do not put bearer tokens in URL query parameters; use client-side hash fragment #access_token=...
           permanentAccessUrl = `${appBaseUrl}/verify/${encodeURIComponent(documentId)}#access_token=${encodeURIComponent(secretToken)}`;
         }
 
+        const appBaseUrl = (process.env.PUBLIC_APP_URL || req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`).replace(/\/$/, '');
         const dispatchResult = await dispatchOwnerNotifications({
           documentId,
           title: title || record?.file_name || 'Registered Document',
@@ -1859,7 +1856,7 @@ export function createServer(options = {}) {
           blockNumber,
           networkName,
           attachment,
-          appBaseUrl: req.headers.origin || `http://${req.headers.host || 'localhost:5173'}`,
+          appBaseUrl,
           secureAccessUrl: permanentAccessUrl,
         });
 
@@ -1920,10 +1917,9 @@ export function createServer(options = {}) {
           return;
         }
 
-        const filePath = path.resolve(uploadsDir, record.stored_path);
-        if (filePath.startsWith(uploadsDir) && fs.existsSync(filePath)) {
-          try { fs.unlinkSync(filePath); } catch {}
-        }
+        try {
+          await storageProvider.deletePdf(documentId, record.stored_path);
+        } catch {}
         deleteDocStmt.run(documentId);
       }
 

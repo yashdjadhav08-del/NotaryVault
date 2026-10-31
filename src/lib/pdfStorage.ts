@@ -81,14 +81,28 @@ export const LOCAL_STORAGE_DISCLAIMER =
  * Returns the base URL for the local storage API backend.
  */
 export function getBackendBaseUrl(): string {
-  if (typeof process !== 'undefined' && process.env?.VITE_STORAGE_BACKEND_URL) {
-    return process.env.VITE_STORAGE_BACKEND_URL.replace(/\/$/, '');
+  // 1. Process environment (SSR or test runner)
+  if (typeof process !== 'undefined' && process.env) {
+    if (process.env.VITE_STORAGE_SERVER_URL) return process.env.VITE_STORAGE_SERVER_URL.replace(/\/$/, '');
+    if (process.env.VITE_STORAGE_BACKEND_URL) return process.env.VITE_STORAGE_BACKEND_URL.replace(/\/$/, '');
+    if (process.env.VITE_API_URL) return process.env.VITE_API_URL.replace(/\/$/, '');
   }
-  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_STORAGE_BACKEND_URL) {
-    return (import.meta as any).env.VITE_STORAGE_BACKEND_URL.replace(/\/$/, '');
+  // 2. Vite import.meta.env
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env) {
+    const metaEnv = (import.meta as any).env;
+    if (metaEnv.VITE_STORAGE_SERVER_URL) return metaEnv.VITE_STORAGE_SERVER_URL.replace(/\/$/, '');
+    if (metaEnv.VITE_STORAGE_BACKEND_URL) return metaEnv.VITE_STORAGE_BACKEND_URL.replace(/\/$/, '');
+    if (metaEnv.VITE_API_URL) return metaEnv.VITE_API_URL.replace(/\/$/, '');
   }
+  // 3. Global window override (useful for runtime configuration)
+  if (typeof window !== 'undefined' && (window as any).__NOTARYVAULT_STORAGE_URL__) {
+    return String((window as any).__NOTARYVAULT_STORAGE_URL__).replace(/\/$/, '');
+  }
+  // 4. In browser: if running on localhost or 127.0.0.1, fallback to local dev server (http://localhost:5001)
   if (typeof window !== 'undefined') {
-    return '';
+    const hostname = window.location.hostname;
+    const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1';
+    return isLocalhost ? 'http://localhost:5001' : '';
   }
   return 'http://localhost:5001';
 }
@@ -778,21 +792,34 @@ export async function uploadPdfToServer(
       body: buffer,
     });
 
-    if (res.ok) {
+    // Check Content-Type to prevent false-positives from Vercel SPA router returning index.html
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('text/html') || !contentType.includes('application/json')) {
+      const text = await res.text().catch(() => '');
+      const isHtml = text.trim().startsWith('<!DOCTYPE') || text.includes('<html');
+      return {
+        success: false,
+        error: isHtml
+          ? 'Storage Server Offline/Unconfigured: Received HTML instead of API response. On Vercel, please set VITE_STORAGE_SERVER_URL in your Vercel Project Environment Variables pointing to your persistent backend server URL.'
+          : `Storage backend returned non-JSON response (HTTP ${res.status}).`,
+      };
+    }
+
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) {
       return { success: true };
     }
 
-    const errData = await res.json().catch(() => ({}));
     const isConflict = res.status === 409;
     return {
       success: false,
       isConflict,
-      error: errData.error || `Local backend storage error (HTTP ${res.status}).`,
+      error: data.error || `Storage backend error (HTTP ${res.status}).`,
     };
   } catch (err: any) {
     return {
       success: false,
-      error: `Could not reach local storage backend: ${err?.message || 'Connection refused.'}`,
+      error: `Could not reach storage backend: ${err?.message || 'Connection refused.'}`,
     };
   }
 }
@@ -819,6 +846,14 @@ export async function verifyServerStorage(
     const endpoint = `${baseUrl}/api/documents/${encodeURIComponent(cleanId)}/verify-storage`;
 
     const res = await fetch(endpoint);
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('text/html') || !contentType.includes('application/json')) {
+      return {
+        verified: false,
+        error: 'Storage server returned invalid response (HTML instead of JSON). Ensure VITE_STORAGE_SERVER_URL is configured in your production environment.',
+      };
+    }
+
     if (res.ok) {
       const data = await res.json();
       if (expectedHash && data.sha256Hash) {
@@ -882,6 +917,14 @@ export async function confirmServerRegistration(
       body: JSON.stringify(details),
     });
 
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('text/html') || !contentType.includes('application/json')) {
+      return {
+        success: false,
+        error: 'Storage server returned invalid response (HTML instead of JSON).',
+      };
+    }
+
     if (res.ok) {
       return { success: true };
     }
@@ -929,6 +972,17 @@ export async function fetchPdfFromServer(
     }
 
     const res = await fetch(endpoint, { headers });
+    const contentType = res.headers.get('content-type') || '';
+
+    // If server returned HTML, Vercel SPA router served index.html instead of real PDF!
+    if (contentType.includes('text/html')) {
+      return {
+        success: false,
+        status: 404,
+        error: 'Original PDF not found on storage server (endpoint returned web page). Ensure VITE_STORAGE_SERVER_URL is configured.',
+      };
+    }
+
     if (res.ok) {
       const blob = await res.blob();
       const contentDisp = res.headers.get('Content-Disposition') || '';

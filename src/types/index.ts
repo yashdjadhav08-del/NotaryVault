@@ -49,6 +49,7 @@ export interface DocumentRecord {
   registrantAddress?: string;
   ownerEmail?: string;
   ownerMobile?: string;
+  syncStatus?: 'synced' | 'pending_reconciliation';
 }
 
 export type AccessStatus = 'Active' | 'Expired' | 'Revoked';

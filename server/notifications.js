@@ -11,6 +11,9 @@
  * - Supports mock mode for automated testing without sending real emails/SMS.
  */
 
+import net from 'node:net';
+import tls from 'node:tls';
+
 /**
  * Checks whether email and SMS notification providers are genuinely configured in the environment.
  */
@@ -115,6 +118,7 @@ export async function sendEmailNotification(payload) {
     return {
       success: false,
       status: 'unconfigured',
+      category: 'missing_credentials',
       error: providerStatus.email.statusNotice || 'Email provider not configured. Set EMAIL_PROVIDER (resend or smtp) and credentials in .env.',
     };
   }
@@ -161,7 +165,7 @@ export async function sendEmailNotification(payload) {
     }
   }
 
-  const appUrl = (payload.appBaseUrl || 'http://localhost:5173').replace(/\/$/, '');
+  const appUrl = (payload.appBaseUrl || process.env.PUBLIC_APP_URL || 'http://localhost:5173').replace(/\/$/, '');
   const verifyUrl = `${appUrl}/verify/${encodeURIComponent(payload.documentId)}`;
   const accessUrl = payload.secureAccessUrl || `${appUrl}/app/documents/${encodeURIComponent(payload.documentId)}`;
   const isPermanentLink = Boolean(payload.secureAccessUrl);
@@ -376,13 +380,16 @@ export async function sendEmailNotification(payload) {
 
       if (/only send testing emails to your own email address/i.test(rawError) || /testing restrictions/i.test(rawError)) {
         category = 'recipient_not_permitted';
-        safeError = "Recipient address is restricted by the email provider's testing tier. Resend free test keys can only send to your verified account owner email (yashdjzzz@gmail.com). To deliver to any external recipient, please verify your custom sender domain at resend.com/domains.";
+        // Extract the authorized test email from Resend's error message dynamically if present
+        const accountOwnerMatch = rawError.match(/\(([^)]+@[^)]+)\)/);
+        const accountOwnerNotice = accountOwnerMatch ? ` (${accountOwnerMatch[1]})` : '';
+        safeError = `Recipient address "${payload.toEmail.trim()}" is restricted by the email provider's testing sandbox. In test mode (with onboarding@resend.dev), Resend only permits delivery to the registered account owner email${accountOwnerNotice}. To deliver documents to external recipient "${payload.toEmail.trim()}", please verify your custom sender domain at resend.com/domains (with DNS SPF & DKIM records) and set EMAIL_FROM in your environment.`;
       } else if (/invalid `to` field/i.test(rawError) || /example\.com/i.test(rawError) || /testing email address instead of domains/i.test(rawError)) {
         category = 'invalid_recipient_domain';
         safeError = "Recipient email domain is reserved for examples (e.g. example.com). The provider requires an active, deliverable email address.";
       } else if (/domain is not verified/i.test(rawError) || /sender domain/i.test(rawError)) {
         category = 'sender_unverified';
-        safeError = "Sender domain is not verified with the email provider. Please verify your custom domain in the Resend dashboard or use the default test sender.";
+        safeError = `Sender domain is not verified with the email provider. Please verify your custom domain in the Resend dashboard (resend.com/domains) with SPF and DKIM DNS records.`;
       } else if (res.status === 401 || (res.status === 403 && /api key/i.test(rawError))) {
         category = 'invalid_credentials';
         safeError = "Email provider authentication failed. Please verify that your RESEND_API_KEY in .env is valid.";
@@ -408,13 +415,239 @@ export async function sendEmailNotification(payload) {
     }
   }
 
-  // 3. Fallback for custom SMTP
+  // 3. Custom SMTP Provider (Standard TLS / STARTTLS)
+  if (providerStatus.email.provider === 'smtp') {
+    return await dispatchSmtpEmail({
+      toEmail: payload.toEmail.trim(),
+      subject,
+      bodyText,
+      bodyHtml,
+      attachment: payload.attachment,
+      documentId: payload.documentId,
+    });
+  }
+
+  // Fallback for unconfigured
   return {
     success: false,
     status: 'unconfigured',
     category: 'unconfigured',
-    error: 'Email provider is not configured. Setup EMAIL_PROVIDER=resend and RESEND_API_KEY in .env.',
+    error: 'Email provider is not configured. Setup EMAIL_PROVIDER (resend or smtp) and credentials in .env.',
   };
+}
+
+/**
+ * Dispatches an email via standard SMTP (supports direct TLS on port 465 or STARTTLS on port 587/25).
+ */
+async function dispatchSmtpEmail({ toEmail, subject, bodyText, bodyHtml, attachment, documentId }) {
+  return new Promise((resolve) => {
+    try {
+      const host = (process.env.SMTP_HOST || '').trim();
+      const port = parseInt(process.env.SMTP_PORT || '587', 10);
+      const user = (process.env.SMTP_USER || '').trim();
+      const pass = (process.env.SMTP_PASS || '').trim();
+      const fromEmail = (process.env.EMAIL_FROM || user || 'notaryvault@localhost').trim();
+      const isDirectTls = port === 465 || process.env.SMTP_SECURE === 'true';
+
+      const maskedRecipient = maskEmail(toEmail);
+      console.log(`[Notification:SMTP] Connecting to SMTP server ${host}:${port} (DirectTLS=${isDirectTls}, Recipient="${maskedRecipient}")...`);
+
+      let socket;
+      let buffer = '';
+      let step = 0;
+      let isClosed = false;
+
+      const cleanup = () => {
+        if (!isClosed) {
+          isClosed = true;
+          try { socket.end(); socket.destroy(); } catch {}
+        }
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve({
+          success: false,
+          status: 'failed',
+          category: 'network_error',
+          error: `SMTP connection timed out after 20 seconds (${host}:${port}).`,
+        });
+      }, 20000);
+
+      const sendLine = (line) => {
+        socket.write(line + '\r\n');
+      };
+
+      const handleResponse = (code, line) => {
+        if (step === 0 && code === 220) {
+          // Greeting received, send EHLO
+          step = 1;
+          sendLine(`EHLO [127.0.0.1]`);
+        } else if (step === 1 && code === 250) {
+          if (!isDirectTls && (port === 587 || port === 25)) {
+            // Initiate STARTTLS
+            step = 2;
+            sendLine('STARTTLS');
+          } else {
+            // Already secure, proceed to AUTH
+            step = 4;
+            sendLine('AUTH LOGIN');
+          }
+        } else if (step === 2 && code === 220) {
+          // Upgrade to TLS
+          step = 3;
+          socket.removeAllListeners('data');
+          socket.removeAllListeners('error');
+          const secureSocket = tls.connect({
+            socket,
+            host,
+            rejectUnauthorized: process.env.SMTP_IGNORE_TLS !== 'true',
+          });
+          socket = secureSocket;
+          attachListeners();
+          sendLine(`EHLO [127.0.0.1]`);
+        } else if (step === 3 && code === 250) {
+          step = 4;
+          sendLine('AUTH LOGIN');
+        } else if (step === 4 && code === 334) {
+          // Username prompt (base64)
+          step = 5;
+          sendLine(Buffer.from(user).toString('base64'));
+        } else if (step === 5 && code === 334) {
+          // Password prompt (base64)
+          step = 6;
+          sendLine(Buffer.from(pass).toString('base64'));
+        } else if (step === 6 && code === 235) {
+          // Authentication successful!
+          step = 7;
+          // Extract clean address from fromEmail (e.g. "Name <email@domain>" -> "email@domain")
+          const fromAddrMatch = fromEmail.match(/<([^>]+)>/);
+          const cleanFrom = fromAddrMatch ? fromAddrMatch[1] : fromEmail;
+          sendLine(`MAIL FROM:<${cleanFrom}>`);
+        } else if (step === 7 && code === 250) {
+          step = 8;
+          sendLine(`RCPT TO:<${toEmail}>`);
+        } else if (step === 8 && code === 250) {
+          step = 9;
+          sendLine('DATA');
+        } else if (step === 9 && code === 354) {
+          // Send MIME message
+          step = 10;
+          const boundary = `----=_NotaryVaultPart_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+          const altBoundary = `----=_NotaryVaultAlt_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+          
+          let mime = [
+            `From: ${fromEmail}`,
+            `To: ${toEmail}`,
+            `Subject: ${subject}`,
+            `MIME-Version: 1.0`,
+            `Content-Type: multipart/mixed; boundary="${boundary}"`,
+            ``,
+            `--${boundary}`,
+            `Content-Type: multipart/alternative; boundary="${altBoundary}"`,
+            ``,
+            `--${altBoundary}`,
+            `Content-Type: text/plain; charset=UTF-8`,
+            `Content-Transfer-Encoding: 7bit`,
+            ``,
+            bodyText,
+            ``,
+            `--${altBoundary}`,
+            `Content-Type: text/html; charset=UTF-8`,
+            `Content-Transfer-Encoding: 7bit`,
+            ``,
+            bodyHtml,
+            ``,
+            `--${altBoundary}--`,
+          ];
+
+          if (attachment && attachment.content) {
+            const buf = Buffer.isBuffer(attachment.content) ? attachment.content : Buffer.from(attachment.content);
+            const base64Content = buf.toString('base64').replace(/(.{76})/g, '$1\r\n');
+            const fn = attachment.filename || `${documentId}.pdf`;
+            mime.push(
+              `--${boundary}`,
+              `Content-Type: application/pdf; name="${fn}"`,
+              `Content-Transfer-Encoding: base64`,
+              `Content-Disposition: attachment; filename="${fn}"`,
+              ``,
+              base64Content
+            );
+          }
+
+          mime.push(`--${boundary}--`, `.`);
+          socket.write(mime.join('\r\n') + '\r\n');
+        } else if (step === 10 && code === 250) {
+          // Message accepted
+          clearTimeout(timer);
+          sendLine('QUIT');
+          cleanup();
+          const deliveryId = `smtp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          console.log(`[Notification:SMTP] Email dispatch accepted by SMTP server. ID="${deliveryId}".`);
+          resolve({
+            success: true,
+            status: 'accepted',
+            provider: 'smtp',
+            deliveryId,
+            details: 'Accepted by SMTP mail server for queueing and delivery.',
+          });
+        } else if (code >= 400) {
+          clearTimeout(timer);
+          cleanup();
+          console.warn(`[Notification:SMTP] SMTP server returned error code ${code}: "${line}"`);
+          resolve({
+            success: false,
+            status: 'failed',
+            category: code === 535 ? 'invalid_credentials' : 'provider_rejected',
+            error: `SMTP server error (Code ${code}): ${line}`,
+          });
+        }
+      };
+
+      const attachListeners = () => {
+        socket.on('data', (chunk) => {
+          buffer += chunk.toString('utf8');
+          const lines = buffer.split('\r\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line) continue;
+            const match = line.match(/^(\d{3})([ -])(.*)$/);
+            if (match && match[2] === ' ') {
+              handleResponse(parseInt(match[1], 10), line);
+            }
+          }
+        });
+
+        socket.on('error', (err) => {
+          clearTimeout(timer);
+          cleanup();
+          resolve({
+            success: false,
+            status: 'failed',
+            category: 'network_error',
+            error: `SMTP network connection error: ${err.message}`,
+          });
+        });
+      };
+
+      if (isDirectTls) {
+        socket = tls.connect(port, host, {
+          rejectUnauthorized: process.env.SMTP_IGNORE_TLS !== 'true',
+        });
+      } else {
+        socket = net.connect(port, host);
+      }
+
+      attachListeners();
+    } catch (err) {
+      resolve({
+        success: false,
+        status: 'failed',
+        category: 'network_error',
+        error: `Failed to initiate SMTP connection: ${err.message}`,
+      });
+    }
+  });
 }
 
 /**
@@ -453,7 +686,7 @@ export async function _inactiveTwilioSendSmsNotification(payload) {
     };
   }
 
-  const appUrl = (payload.appBaseUrl || 'http://localhost:5173').replace(/\/$/, '');
+  const appUrl = (payload.appBaseUrl || process.env.PUBLIC_APP_URL || 'http://localhost:5173').replace(/\/$/, '');
   const verifyUrl = `${appUrl}/verify/${encodeURIComponent(payload.documentId)}`;
   const accessUrl = payload.secureAccessUrl || verifyUrl;
 

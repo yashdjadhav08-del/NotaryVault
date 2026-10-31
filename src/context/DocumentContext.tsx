@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import type { ReactNode } from 'react';
 import type { 
   DocumentRecord, 
@@ -32,7 +32,8 @@ import {
   clearAllLocalPDFs, 
   uploadPdfToServer, 
   verifyServerStorage, 
-  confirmServerRegistration 
+  confirmServerRegistration,
+  getBackendBaseUrl 
 } from '../lib/pdfStorage';
 import { 
   registerOnChain, 
@@ -103,6 +104,7 @@ interface DocumentContextType {
   checkPropertyConflicts: (propertyId: string, currentOwner: string) => { hasConflict: boolean; existingDocs: DocumentRecord[]; note?: string };
   checkDocumentIdAvailability: (id: string, networkKey?: MSTNetworkKey) => Promise<{ available: boolean; source?: string; reason?: string; warning?: string }>;
   generateAvailableDocumentId: (networkKey?: MSTNetworkKey) => Promise<string>;
+  reconcileRegistration: (docId: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 const DocumentContext = createContext<DocumentContextType | undefined>(undefined);
@@ -479,6 +481,7 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
     let networkChainId: string | undefined = undefined;
     let registrantAddress: string | undefined = undefined;
     let onChainStatus: 'unregistered' | 'registered' | 'revoked' = 'unregistered';
+    let syncStatus: 'synced' | 'pending_reconciliation' = 'synced';
 
     // 6. On-Chain MST Chain registration only after verified storage
     if (params.rawProvider) {
@@ -508,22 +511,35 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
 
         // Persist transaction hash, block number, network, contract address in server database
         if (txHash) {
-          await confirmServerRegistration(candidateId, {
-            txHash,
-            blockNumber,
-            networkName: targetNetName,
-            chainId: networkChainId,
-            contractAddress,
-            registrantAddress,
-            ownerWallet: registrantAddress,
-            title: params.name,
-            category: params.type,
-            issuer: params.owner,
-            status: 'confirmed',
-          });
+          try {
+            await confirmServerRegistration(candidateId, {
+              txHash,
+              blockNumber,
+              networkName: targetNetName,
+              chainId: networkChainId,
+              contractAddress,
+              registrantAddress,
+              ownerWallet: registrantAddress,
+              title: params.name,
+              category: params.type,
+              issuer: params.owner,
+              status: 'confirmed',
+            });
+            syncStatus = 'synced';
+          } catch (syncErr: any) {
+            console.warn('[Register] Server metadata registration deferred:', syncErr);
+            syncStatus = 'pending_reconciliation';
+            addToast(
+              'Blockchain Anchored (Catalog Pending)',
+              `Transaction confirmed on-chain in block #${blockNumber}, but backend catalog sync was deferred: ${syncErr?.message || 'Server unreachable'}. You can reconcile anytime without re-running the blockchain transaction.`,
+              'warning'
+            );
+          }
         }
 
-        addToast(`Registered On ${targetNetName}`, `Confirmed in block #${blockNumber}. Tx: ${txHash?.slice(0, 10)}...`);
+        if (syncStatus === 'synced') {
+          addToast(`Registered On ${targetNetName}`, `Confirmed in block #${blockNumber}. Tx: ${txHash?.slice(0, 10)}...`);
+        }
       } else {
         // Revert cleanly without saving local record or incrementing count
         throw new Error(onChainResult.error || 'Failed to record on-chain.');
@@ -556,6 +572,7 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
       networkName: targetNetName,
       registrantAddress,
       onChainStatus,
+      syncStatus,
     };
 
     setDocuments(prev => {
@@ -1158,7 +1175,8 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
     setSharedRecords([]);
     setActivities([]);
     if (callerAddress) {
-      fetch('http://localhost:5001/api/admin/clear-storage', {
+      const baseUrl = getBackendBaseUrl();
+      fetch(`${baseUrl}/api/admin/clear-storage`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1168,6 +1186,46 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
     }
     addToast('Repository Reset', 'Local repository and cached PDFs cleared by Super Author. On-chain blockchain records remain immutable.', 'info');
   };
+
+  const reconcileRegistration = useCallback(async (docId: string): Promise<{ success: boolean; error?: string }> => {
+    const doc = documents.find(d => d.id === docId);
+    if (!doc) {
+      return { success: false, error: `Document ${docId} not found locally.` };
+    }
+    if (!doc.txHash) {
+      return { success: false, error: `Document ${docId} has no confirmed blockchain transaction to reconcile.` };
+    }
+
+    try {
+      const confirmRes = await confirmServerRegistration(doc.id, {
+        txHash: doc.txHash,
+        blockNumber: doc.blockNumber,
+        networkName: doc.networkName || (doc.networkKey === 'mainnet' ? 'MST Chain Mainnet' : 'MST Chain Testnet'),
+        chainId: doc.networkChainId,
+        contractAddress: doc.contractAddress,
+        registrantAddress: doc.registrantAddress || doc.owner,
+        ownerWallet: doc.registrantAddress,
+        title: doc.name,
+        category: doc.type,
+        issuer: doc.owner,
+        status: 'confirmed',
+      });
+
+      if (confirmRes.success) {
+        setDocuments(prev => {
+          const updated = prev.map(d => d.id === docId ? { ...d, syncStatus: 'synced' as const } : d);
+          saveDocuments(updated, selectedNetwork);
+          return updated;
+        });
+        addToast('Reconciliation Complete', `Document ${docId} metadata synchronized with backend database.`, 'success');
+        return { success: true };
+      } else {
+        return { success: false, error: confirmRes.error || 'Server rejected reconciliation confirmation.' };
+      }
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Network error during reconciliation.' };
+    }
+  }, [documents, selectedNetwork]);
 
   return (
     <DocumentContext.Provider
@@ -1194,6 +1252,7 @@ export const DocumentProvider: React.FC<{ children: ReactNode }> = ({ children }
         checkPropertyConflicts,
         checkDocumentIdAvailability,
         generateAvailableDocumentId,
+        reconcileRegistration,
       }}
     >
       {children}
